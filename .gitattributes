@@ -1,0 +1,8 @@
+# Exclude vendored / generated code from GitHub language statistics.
+# Hand-written code lives in app/ (firmware) and tools/ (PC automation).
+Drivers/** linguist-vendored
+Core/** linguist-generated
+cmake/** linguist-generated
+startup_stm32h533xx.s linguist-vendored
+*.ioc linguist-generated
+.mxproject linguist-generated
