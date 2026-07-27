@@ -1,0 +1,10 @@
+build/
+mx.scratch
+__pycache__/
+*.pyc
+
+# runtime outputs (board-specific cal, measurement results)
+config/
+results/
+tools/_vendor/
+*.log
