@@ -13,9 +13,17 @@
 
 #include "app_main.h"           /* g_adc device instance */
 #include "chip1.h"
+#include "chip1a_i2c.h"
 #include "dac_internal.h"
 #include "cal_store.h"
 #include "meas.h"
+#include "delay.h"
+
+/* 인터페이스 선택 (iface 명령): 0 = SPI(CHIP1, 2선 펄스) / 1 = I2C(CHIP1A).
+   부팅 기본 SPI — 기존 스크립트/워크플로우와 완전 호환. */
+#define IFACE_SPI  0U
+#define IFACE_I2C  1U
+static uint8_t g_iface = IFACE_SPI;
 
 #define ASCII_ESC  0x1B
 
@@ -153,6 +161,9 @@ static void cmd_help(int argc, char *argv[])
   cli_println("  rr <addr>                        - CHIP1 register read");
   cli_println("  rd <count>                       - capture samples (ESC aborts)");
   cli_println("  id                               - read chip ID (expect 0x9210)");
+  cli_println("  iface [spi|i2c]                  - select/show chip interface (CHIP1/CHIP1A)");
+  cli_println("  iscan                            - I2C address scan 0x08-0x77 (iface i2c)");
+  cli_println("  stop pd[ ext|pp]|wake            - power-down current test (SPI): enter/exit");
   cli_println("  dac init                         - enable DAC ch1/ch2, output 0V");
   cli_println("  dac set <ch> <uV>                - ch=1|2, output voltage (max 3300000)");
   cli_println("  dac cal <ch> <offset_uV> <ppm>   - set calibration coefficients");
@@ -336,10 +347,20 @@ static void cmd_wr(int argc, char *argv[])
     return;
   }
 
-  if (chip1_write_reg(&g_adc, (uint8_t)addr, (uint8_t)val,
-                       CHIP1_DRDY_TIMEOUT_MS) != CHIP1_OK)
+  int rc;
+  if (g_iface == IFACE_I2C)
   {
-    cli_println("ERR adc no drdy (timeout)");
+    rc = chip1a_write_reg(&g_adc, (uint8_t)addr, (uint8_t)val);
+  }
+  else
+  {
+    rc = chip1_write_reg(&g_adc, (uint8_t)addr, (uint8_t)val,
+                          CHIP1_DRDY_TIMEOUT_MS);
+  }
+  if (rc != 0)
+  {
+    cli_println((g_iface == IFACE_I2C) ? "ERR i2c nack"
+                                       : "ERR adc no drdy (timeout)");
     return;
   }
   cli_println("OK");
@@ -356,14 +377,154 @@ static void cmd_rr(int argc, char *argv[])
     return;
   }
 
-  if (chip1_read_reg(&g_adc, (uint8_t)addr, &val,
-                      CHIP1_DRDY_TIMEOUT_MS) != CHIP1_OK)
+  int rc;
+  if (g_iface == IFACE_I2C)
   {
-    cli_println("ERR adc no drdy (timeout)");
+    rc = chip1a_read_reg(&g_adc, (uint8_t)addr, &val);
+  }
+  else
+  {
+    rc = chip1_read_reg(&g_adc, (uint8_t)addr, &val,
+                         CHIP1_DRDY_TIMEOUT_MS);
+  }
+  if (rc != 0)
+  {
+    cli_println((g_iface == IFACE_I2C) ? "ERR i2c nack"
+                                       : "ERR adc no drdy (timeout)");
     return;
   }
   cli_printf("0x%02X\r\n", val);
   cli_println("OK");
+}
+
+/* 'stop': STOP(파워다운) 전류 측정 시퀀스 — 신규/기존 패키지 시료 비교용
+   테스트 플랜 (2026-08-10):
+     power on -> SCK 0 -> 2ms 대기 (resetb 1.5ms + eFuse cloning 0.5ms)
+     -> SCK 1 -> 500us 대기 (파워다운 진입 >200us) -> VDD 전류 측정(DMM)
+   'stop pd'   : 위 시퀀스 실행 후 SCK High **유지** (파워다운 상태 지속 —
+                 이 상태에서 PC가 DMM으로 VDD 전류를 읽는다)
+   'stop wake' : SCK Low + tWU(350ms) 대기 — 정상 동작 복귀 */
+static void cmd_stop(int argc, char *argv[])
+{
+  if (g_iface != IFACE_SPI)
+  {
+    cli_println("ERR iface not spi (stop test is SPI-mode only)");
+    return;
+  }
+  if (((argc == 2) || (argc == 3)) && (strcmp(argv[1], "pd") == 0))
+  {
+    /* SCK 오픈드레인 구동, 풀업 소스 2모드:
+       - 'stop pd'     = **내부 풀업** (팀 사양, 2026-08-12): MCU 내장
+         ~40k가 High를 3.3V로. 외부 부품 0개, 빈 소켓 오프셋 0.
+         ⚠ 단 High=3.3V < VIH(3.5V@VDD5V) — 칩 입력단 관통 전류(~345µA)가
+         시료 측정값에 섞이는 것이 실측됨 (3.3V 조건 346µA vs 5V 조건 1µA).
+       - 'stop pd ext' = **외부 풀업** (NOPULL): 외부 4.7k→5V 저항 필요,
+         High=5V로 VIH 충족 + 관통 전류 0. 두 조건 비교 시연용으로 병존.
+       - 'stop pd pp'  = **푸시풀 High** (2026-08-13, 레벨시프터 대비):
+         핀을 3.3V로 직접 밈 — 레벨시프터가 칩측 5V로 변환하는 구성용.
+         약한 풀업 구동을 못 받는 TXB류 오토방향 시프터까지 호환. */
+    uint32_t pull = GPIO_PULLUP;
+    uint32_t mode = GPIO_MODE_OUTPUT_OD;
+    if (argc == 3)
+    {
+      if (strcmp(argv[2], "ext") == 0)
+      {
+        pull = GPIO_NOPULL;
+      }
+      else if (strcmp(argv[2], "pp") == 0)
+      {
+        pull = GPIO_NOPULL;
+        mode = GPIO_MODE_OUTPUT_PP;
+      }
+      else
+      {
+        cli_println("ERR bad arg");
+        return;
+      }
+    }
+    GPIO_InitTypeDef gi = {0};
+    gi.Pin   = g_adc.sck_pin;
+    gi.Mode  = mode;
+    gi.Pull  = pull;
+    gi.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_WritePin(g_adc.sck_port, g_adc.sck_pin, GPIO_PIN_RESET);
+    HAL_GPIO_Init(g_adc.sck_port, &gi);
+
+    HAL_Delay(2);                    /* SCK Low: resetb 1.5ms + eFuse 0.5ms */
+    HAL_GPIO_WritePin(g_adc.sck_port, g_adc.sck_pin, GPIO_PIN_SET);
+    delay_us(500);                   /* PD 진입 >200us (untrimmed 500us) */
+    cli_println("OK");               /* 해제 유지 — 풀업이 High 유지, PD 지속 */
+    return;
+  }
+  if ((argc == 2) && (strcmp(argv[1], "wake") == 0))
+  {
+    HAL_GPIO_WritePin(g_adc.sck_port, g_adc.sck_pin, GPIO_PIN_RESET);
+    chip1_gpio_init(&g_adc);        /* 푸시풀 Low 복원 (일반 SPI 상태) */
+    HAL_Delay(350);                  /* tWU: 파워다운 해제 대기 */
+    cli_println("OK");
+    return;
+  }
+  cli_println("ERR bad arg");
+}
+
+/* 'iscan': I2C 주소 스캔 (0x08~0x77). ACK하는 주소를 한 줄씩 출력.
+   CHIP1A 브링업용 — 실리콘 주소가 데이터시트(0x2A)와 다를 가능성 확인. */
+static void cmd_iscan(int argc, char *argv[])
+{
+  (void)argc; (void)argv;
+
+  if (g_iface != IFACE_I2C)
+  {
+    cli_println("ERR iface not i2c (run 'iface i2c' first)");
+    return;
+  }
+
+  int found = 0;
+  for (uint8_t a = 0x08U; a <= 0x77U; a++)
+  {
+    if (chip1a_probe(&g_adc, a) == CHIP1A_OK)
+    {
+      cli_printf("0x%02X\r\n", a);
+      found++;
+    }
+  }
+  if (found == 0)
+  {
+    cli_println("none");
+  }
+  cli_println("OK");
+}
+
+/* 'iface': 칩 인터페이스 선택. CHIP1(SPI 2선 펄스) <-> CHIP1A(I2C 0x2A).
+   spi 복귀 시 SCK Low + tWU(350ms) 대기 — I2C idle(High) 동안 SPI 칩이
+   파워다운됐을 수 있음 (§3.1). */
+static void cmd_iface(int argc, char *argv[])
+{
+  if (argc == 1)
+  {
+    cli_println((g_iface == IFACE_I2C) ? "i2c" : "spi");
+    cli_println("OK");
+    return;
+  }
+  if (argc == 2 && strcmp(argv[1], "spi") == 0)
+  {
+    chip1_gpio_init(&g_adc);      /* SCK output Low, SDA input */
+    if (g_iface == IFACE_I2C)
+    {
+      HAL_Delay(350);              /* tWU: 파워다운 해제 대기 */
+    }
+    g_iface = IFACE_SPI;
+    cli_println("OK");
+    return;
+  }
+  if (argc == 2 && strcmp(argv[1], "i2c") == 0)
+  {
+    chip1a_gpio_init(&g_adc);     /* 두 라인 open-drain, idle High */
+    g_iface = IFACE_I2C;
+    cli_println("OK");
+    return;
+  }
+  cli_println("ERR bad arg");
 }
 
 /* 'uid': MCU 96bit 고유 ID — PC측 보드 식별용 (캘 이력 매칭).
@@ -395,13 +556,30 @@ static void cmd_id(int argc, char *argv[])
 {
   (void)argc; (void)argv;
   uint8_t idh = 0, idl = 0;
+  int rc;
 
-  if ((chip1_read_reg(&g_adc, CHIP1_REG_IDH, &idh,
-                       CHIP1_DRDY_TIMEOUT_MS) != CHIP1_OK) ||
-      (chip1_read_reg(&g_adc, CHIP1_REG_IDL, &idl,
-                       CHIP1_DRDY_TIMEOUT_MS) != CHIP1_OK))
+  if (g_iface == IFACE_I2C)
   {
-    cli_println("ERR adc no drdy (timeout)");
+    rc = chip1a_read_reg(&g_adc, CHIP1_REG_IDH, &idh);
+    if (rc == 0)
+    {
+      rc = chip1a_read_reg(&g_adc, CHIP1_REG_IDL, &idl);
+    }
+  }
+  else
+  {
+    rc = chip1_read_reg(&g_adc, CHIP1_REG_IDH, &idh,
+                         CHIP1_DRDY_TIMEOUT_MS);
+    if (rc == 0)
+    {
+      rc = chip1_read_reg(&g_adc, CHIP1_REG_IDL, &idl,
+                           CHIP1_DRDY_TIMEOUT_MS);
+    }
+  }
+  if (rc != 0)
+  {
+    cli_println((g_iface == IFACE_I2C) ? "ERR i2c nack"
+                                       : "ERR adc no drdy (timeout)");
     return;
   }
   cli_printf("0x%02X%02X\r\n", idh, idl);   /* expect 0x9210 */
@@ -431,10 +609,20 @@ static void cmd_rd(int argc, char *argv[])
     }
 
     int32_t sample;
-    if (chip1_read_sample(&g_adc, &sample, NULL,
-                           CHIP1_DRDY_TIMEOUT_MS) != CHIP1_OK)
+    int rc;
+    if (g_iface == IFACE_I2C)
     {
-      cli_println("ERR adc no drdy (timeout)");
+      rc = chip1a_read_sample(&g_adc, &sample, CHIP1_DRDY_TIMEOUT_MS);
+    }
+    else
+    {
+      rc = chip1_read_sample(&g_adc, &sample, NULL,
+                              CHIP1_DRDY_TIMEOUT_MS);
+    }
+    if (rc != 0)
+    {
+      cli_println((rc == CHIP1A_ERR_NACK) ? "ERR i2c nack"
+                                           : "ERR adc no drdy (timeout)");
       return;
     }
     cli_printf("%ld\r\n", (long)sample);   /* stream one line per sample */
@@ -455,6 +643,9 @@ static const cli_command_t commands[] = {
   { "rr",   cmd_rr   },
   { "rd",   cmd_rd   },
   { "id",   cmd_id   },
+  { "iface", cmd_iface },
+  { "iscan", cmd_iscan },
+  { "stop",  cmd_stop  },
   { "uid",  cmd_uid  },
   { "dac",  cmd_dac  },
   { "meas", cmd_meas },

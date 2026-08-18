@@ -2,7 +2,7 @@
 온도 챔버 드라이버 (PC측) — CHIP1 온도 스윕 자동화용.
 
 프로토콜 근거: docs/"Block diagram_Test system for CHIP1_251204A.pdf" p.3
-(실측 기록). ESPEC 매뉴얼 원본은 미확보 — 실측 기록이 우선 소스.
+(팀 실측 기록). ESPEC 매뉴얼 원본은 미확보 — 실측 기록이 우선 소스.
 
 프로파일 2종:
   SU661_GPIB : 115200, Prologix GPIB-USB 컨버터 경유.

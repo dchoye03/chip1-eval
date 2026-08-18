@@ -51,6 +51,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     app/dac_internal.c
     app/delay.c
     app/chip1.c
+    app/chip1a_i2c.c
     app/meas.c
     # HAL ADC (v1.7.0, ST GitHub에서 추가 - CubeMX 생성 목록에 없음)
     Drivers/STM32H5xx_HAL_Driver/Src/stm32h5xx_hal_adc.c

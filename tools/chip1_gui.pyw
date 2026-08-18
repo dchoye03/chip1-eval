@@ -2,12 +2,12 @@
 CHIP1 ADC test — GUI front-end (v4 펌웨어 이식판).
 
 tools/chip1_autotest.py(신판)를 import해서 시리얼/엑셀 로직을 재사용한다.
-구 GUI(레거시 2보드 셋업용)와 같은 구성이지만:
+구 GUI(old test/chip1_gui.pyw)와 같은 구성이지만:
   - 보드 1개 (Nucleo 통합) — 보드 식별/칩선택 없음, id(0x9210) 확인으로 대체
   - DAC 채널 매핑 반전: ch1(PA4)=AINP, ch2(PA5)=AINN  ← 구셋업과 반대!
   - 내장 DAC cal 계수 자동 입력 (부팅마다 필요, autotest의 DAC_CAL 사용)
-  - 기본 엑셀 = CHIP1_ADC_validation.xlsx (없으면 template/report_template.xlsx
-    복사로 자동 생성, 템플릿 원본은 수정 안 함)
+  - 기본 엑셀 = CHIP1_ADC_validation.xlsx (없으면 원본 복사로 자동 생성,
+    원본 26.7.14.adc.xlsx는 절대 수정 안 함)
 
 더블클릭 실행 (pythonw, 콘솔 없음 — 출력은 아래 로그 창에).
 """
@@ -184,6 +184,8 @@ def create_sweep_sheet(excel: Path, label: str = "") -> str:
     ws = wb.copy_worksheet(template)
 
     name = datetime.now().strftime("SW_%m%d_%H%M")
+    if g.IFACE == "i2c":
+        name += "_I2C"          # 칩 인터페이스 구별 (상온 시트 분리와 짝)
     if label:
         name += "_" + re.sub(r"[\[\]:*?/\\'\s]+", "_", label.strip())
     base = name[:28]                      # 엑셀 시트명 31자 제한 + 중복 여유
@@ -234,12 +236,29 @@ class App:
         root.minsize(560, 500)
         self.q: queue.Queue[str] = queue.Queue()
 
+        # 로고: 창 아이콘 + 헤더 (없어도 GUI는 정상 동작)
+        img_dir = Path(__file__).resolve().parent / "image"
+        try:
+            self._icon_img = tk.PhotoImage(file=str(img_dir / "logo_icon.png"))
+            root.iconphoto(True, self._icon_img)
+        except Exception:
+            self._icon_img = None
+
         frm = ttk.Frame(root, padding=10)
         frm.grid(sticky="nsew")
         root.columnconfigure(0, weight=1)
         root.rowconfigure(0, weight=1)
 
         self._row = 0
+
+        try:
+            self._logo_img = tk.PhotoImage(
+                file=str(img_dir / "logo.png")).subsample(2)
+            ttk.Label(frm, image=self._logo_img).grid(
+                row=self._row, column=0, columnspan=3, sticky="w", pady=(0, 6))
+            self._row += 1
+        except Exception:
+            self._logo_img = None
 
         notice = ttk.LabelFrame(frm, text="준비사항 (read me first!)", padding=6)
         notice.grid(row=self._row, column=0, columnspan=3, sticky="we", pady=(0, 8))
@@ -254,7 +273,7 @@ class App:
             "    미개조 보드는 VREF가 1.2V대로 표시 — 고장이 아니라 측정 불가 상태\n"
             "    (사용하려면 C1-REFIN 쇼트 개조 필요, docs 참조)\n"
             "5) 스윕 결과 = 새 엑셀 시트(SW_...) + results\\sweeps\\<런폴더>\\\n"
-            "6) 파이썬 라이브러리: pip install -r requirements.txt (tools\\_vendor 있으면 자동 사용)"
+            "6) 파이썬 라이브러리 설치 불필요 (tools\\_vendor 내장)"
         )).grid(sticky="w")
         self._row += 1
 
@@ -273,6 +292,23 @@ class App:
         self.settle = add_entry("Settle wait sec (드리프트 시 60)", "0")
         self.dut = add_entry("DUT #  (blank = next empty in Excel)", "")
         self.port = add_entry("COM port  (blank = auto)", "")
+
+        # 칩 인터페이스 선택 — SPI(CHIP1) / I2C(CHIP1A). 선택 즉시 공용
+        # 로직(g.IFACE)에 반영되어 Run/스윕/캘/보드확인 모든 경로에 적용된다.
+        ttk.Label(frm, text="Interface (칩 종류)").grid(
+            row=self._row, column=0, sticky="w")
+        self.iface = tk.StringVar(value="SPI (CHIP1)")
+        iface_box = ttk.Combobox(frm, textvariable=self.iface, state="readonly",
+                                 width=18,
+                                 values=("SPI (CHIP1)", "I2C (CHIP1A)"))
+        iface_box.grid(row=self._row, column=1, sticky="we", pady=2)
+        self._row += 1
+
+        def apply_iface(*_):
+            g.set_iface("i2c" if "I2C" in self.iface.get() else "spi")
+
+        self.iface.trace_add("write", apply_iface)
+        apply_iface()
 
         ttk.Label(frm, text="Excel report").grid(row=self._row, column=0, sticky="w")
         self.excel = tk.StringVar(value=str(g.EXCEL_PATH))
@@ -400,6 +436,54 @@ class App:
         ttk.Label(swf, textvariable=self.sw_status, foreground="dark blue",
                   justify="left").grid(row=6, column=0, columnspan=5, sticky="w", pady=(4, 0))
         # (스윕 섹션은 오른쪽 열이라 왼쪽 self._row를 소비하지 않음)
+
+        # STOP(파워다운) 전류 측정 — 신규/기존 패키지 시료 비교 (2026-08-10 플랜)
+        # 시퀀스: SCK 0 → 2ms → SCK 1 → 500us 유지 → DMM으로 VDD 전류 측정
+        stf = ttk.LabelFrame(self._right,
+                             text="Stop Current (파워다운 전류, DM3058E)",
+                             padding=6)
+        stf.pack(side="top", fill="x", pady=(6, 0))
+        ttk.Label(stf, text="시료 라벨").grid(row=0, column=0, sticky="w")
+        self.st_label = tk.StringVar(value="기존#1")
+        ttk.Entry(stf, textvariable=self.st_label, width=12).grid(
+            row=0, column=1, sticky="w", padx=(2, 6))
+        ttk.Label(stf, text="측정 횟수").grid(row=0, column=2, sticky="e")
+        self.st_n = tk.StringVar(value="5")
+        ttk.Entry(stf, textvariable=self.st_n, width=5).grid(
+            row=0, column=3, sticky="w", padx=(2, 6))
+        ttk.Label(stf, text="DMM (blank=자동, MOCK=리허설)").grid(
+            row=1, column=0, columnspan=2, sticky="w")
+        self.st_dmm = tk.StringVar(value="")
+        ttk.Entry(stf, textvariable=self.st_dmm, width=18).grid(
+            row=1, column=2, columnspan=2, sticky="we", padx=(2, 6))
+        self.stopcur_btn = ttk.Button(stf, text="측정",
+                                      command=self.stopcur_clicked)
+        self.stopcur_btn.grid(row=0, column=4, sticky="nswe", padx=(4, 0))
+
+        def open_stop_report():
+            p = g.RESULTS_DIR / "STOP_current_report.xlsx"
+            if p.exists():
+                os.startfile(p)   # ⚠ 열어둔 채 측정하면 자동 갱신 실패 (잠김)
+            else:
+                messagebox.showinfo("보고표", "아직 생성 전 — 측정을 먼저 실행하세요")
+
+        ttk.Button(stf, text="보고표 열기", command=open_stop_report).grid(
+            row=1, column=4, sticky="nswe", padx=(4, 0))
+        # VDD 조건: 3.3V=현행 직결 자동화 / 5V=레벨시프터 장착 시 (시프터가
+        # MCU 3.3V 신호를 칩측 5V로 변환 — 펌웨어 'stop pd pp' 사용)
+        ttk.Label(stf, text="VDD 조건").grid(row=2, column=0, sticky="w")
+        self.st_vdd = tk.StringVar(value="3.3V (직결)")
+        ttk.Combobox(stf, textvariable=self.st_vdd, state="readonly", width=18,
+                     values=["3.3V (직결)", "5V (레벨시프터)"]).grid(
+            row=2, column=1, columnspan=2, sticky="w", padx=(2, 6))
+        ttk.Label(stf, foreground="gray", justify="left", text=(
+            "라벨 규칙: '기존'으로 시작=기존 그룹 / '빈소켓'·'baseline' 포함="
+            "베이스라인 / 그 외=신규 그룹(시료 ID 권장, 예: 신규#1)\n"
+            "같은 라벨 재측정 = 최신값으로 갱신. 측정마다 보고표 자동 갱신 "
+            "(보고표 엑셀은 닫아둘 것). 결과: results\\stop_current.csv\n"
+            "VDD 5V는 레벨시프터(SCK·SDA 3.3↔5V 변환) 장착 후 선택 — 결과는 "
+            "보고표 '5V_자동' 시트로 분리 기록")).grid(
+            row=3, column=0, columnspan=5, sticky="w")
 
         # 보드 상태 표시줄 (연결 감지 — UID + 플래시 캘 유무)
         self.board_status = tk.StringVar(value="보드 상태: 미확인")
@@ -605,6 +689,141 @@ class App:
         ext = [f"{n}: 외부캘 {d[k].get('date', '?')[:10]}"
                for k, n in (("vref", "VREF"), ("vdd", "VDD")) if d.get(k)]
         return head + ("  |  " + "  |  ".join(ext) if ext else "")
+
+    # ---------------- STOP(파워다운) 전류 측정 ----------------
+
+    def stopcur_clicked(self):
+        try:
+            n = int(self.st_n.get().strip() or "5")
+            if not 1 <= n <= 100:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Stop Current", "측정 횟수는 1~100 사이 정수로 입력하세요")
+            return
+        if g.IFACE != "spi":
+            messagebox.showerror(
+                "Stop Current",
+                "STOP 전류 테스트는 SPI 칩 전용입니다.\n"
+                "Interface를 'SPI (CHIP1)'로 바꾼 뒤 실행하세요.")
+            return
+        p = {"label": self.st_label.get().strip() or "unnamed",
+             "n": n,
+             "dmm": self.st_dmm.get().strip() or None,
+             # 5V(레벨시프터) = 'stop pd pp' (푸시풀 High — 시프터가 5V로
+             # 변환. TXB류 오토방향 시프터도 호환). 3.3V = 'stop pd' (내부 풀업).
+             "vdd": "5.0" if self.st_vdd.get().startswith("5") else "3.3"}
+        self.stopcur_btn.configure(state="disabled")
+        self.run_btn.configure(state="disabled")
+        threading.Thread(target=self._stopcur_worker, args=(p,),
+                         daemon=True).start()
+
+    def _stopcur_worker(self, p: dict):
+        """테스트 플랜 STOP Procedure: 펌웨어 'stop pd'(SCK 0→2ms→1→500us,
+        High 유지) → DMM으로 VDD 전류 N회 → 'stop wake' 복귀 → CSV 기록."""
+        from dmm_dm3058 import DM3058, DmmError
+        old = (sys.stdout, sys.stderr)
+        sys.stdout = sys.stderr = QueueWriter(self.q)
+        try:
+            pd_cmd = "stop pd pp" if p["vdd"] == "5.0" else "stop pd"
+            print(f"=== STOP 전류 측정 [{p['label']}] — VDD {p['vdd']}V ===")
+            port = norm_port(self.port.get()) or g.find_port()
+            dmm = DM3058(p["dmm"])
+            print(f"  DMM: {dmm.idn}")
+            # 오토레인지: 기존 칩(~600µA)과 신규 칩(~1µA)의 스케일이 달라
+            # 고정 레인지로는 한쪽의 분해능을 잃음. PD 진입 후 0.5s 대기가
+            # 레인지 정착 시간을 겸하고, 무효값 필터가 전환 글리치를 걸러냄.
+            dmm.set_dci(None)
+            try:
+                with g.open_port(port) as ser:
+                    # 선(先)웨이크: 직전 측정이 PD 유지로 끝났으므로, 교체된
+                    # 칩은 SCK High 상태에서 부팅 → 태어나자마자 PD에 들어가
+                    # id가 no-drdy로 실패한다 (실사고). wake로 정상 기동 후
+                    # 검증·측정 — 테스트 플랜의 "SCK 0로 부팅" 조건과도 일치.
+                    g.send_cmd(ser, "stop wake")
+                    time.sleep(0.3)           # 첫 변환 여유
+                    try:
+                        g.check_id(ser)
+                    except g.CliError:
+                        print("  !! id 확인 실패 — SDA 미배선이면 무시 가능")
+                    # 육안 확인용 홀드: wake(mA대) → pd(µA대) 전환이 DMM에서
+                    # 보이도록 각 상태를 잠시 유지 (요청: 전환이 너무 빨라 안 보임)
+                    print("  wake 유지 3초 — DMM이 mA대인지 확인하세요")
+                    time.sleep(3.0)
+                    g.send_cmd(ser, pd_cmd)
+                    print("  PD 진입 — DMM이 µA대로 떨어지는지 확인하세요")
+                    print("  파워다운 진입 (SCK High 유지)")
+                    # 안정화 대기: pd 전환 직후 라인 0→5V 충전 여운으로 전류가
+                    # 수 초에 걸쳐 지수적으로 감쇠 (실측 0.87→0.004µA).
+                    # 연속 두 판독의 변화가 2% 또는 0.05µA 미만이면 안정 판정.
+                    print("  안정화 대기 중…")
+                    prev = None
+                    t0 = time.time()
+                    while time.time() - t0 < 20:
+                        v = abs(dmm.read_current()) * 1e6
+                        if prev is not None and \
+                                abs(v - prev) < max(prev * 0.02, 0.05):
+                            break
+                        prev = v
+                        time.sleep(0.5)
+                    print(f"  안정화 완료 ({time.time() - t0:.1f}s) — 본판독 시작")
+                    vals = []
+                    for i in range(p["n"]):
+                        v = abs(dmm.read_current())   # 극성은 하니스 방향일 뿐
+                        vals.append(v * 1e6)          # uA
+                        print(f"    {i + 1}/{p['n']}: {v * 1e6:.3f} uA")
+                        time.sleep(0.3)
+                    # 측정 후 PD 유지 (팀 요청): DMM으로 계속 관찰 가능.
+                    # 깨우기 = 테라텀 'stop wake', 또는 다음 측정 시 시퀀스가
+                    # 자동으로 재시작(SCK Low 2ms부터). 칩 교체는 어차피
+                    # 12V 분리 후 수행.
+                    print("  측정 종료 — PD 상태 유지 (SCK High, DMM 관찰 가능)")
+            finally:
+                dmm.close()
+
+            avg = sum(vals) / len(vals)
+            print(f"  결과: 평균 {avg:.3f} uA "
+                  f"(min {min(vals):.3f} / max {max(vals):.3f}, n={len(vals)})")
+            csv_path = g.RESULTS_DIR / "stop_current.csv"
+            # 헤더 자가복구: 파일이 없거나, 엑셀에서 내용을 지워 헤더가
+            # 사라진 경우(실사고 — 보고표 KeyError 'label')에도 복원한다.
+            header = ["datetime", "label", "n", "avg_uA",
+                      "min_uA", "max_uA", "readings_uA", "vdd"]
+            old_lines = []
+            if csv_path.exists():
+                try:
+                    old_lines = [l for l in csv_path.read_text(
+                        encoding="utf-8-sig").splitlines() if l.strip()]
+                except OSError:
+                    old_lines = []
+            if not old_lines or not old_lines[0].startswith("datetime,"):
+                old_lines.insert(0, ",".join(header))
+            elif "vdd" not in old_lines[0]:
+                # 구버전 헤더 → vdd 컬럼 추가 (구행은 값이 없어 3.3 취급됨)
+                old_lines[0] = ",".join(header)
+            new_row = ",".join(str(x) for x in [
+                datetime.now().isoformat(timespec="seconds"),
+                p["label"], len(vals), round(avg, 3),
+                round(min(vals), 3), round(max(vals), 3),
+                " ".join(f"{x:.3f}" for x in vals), p["vdd"]])
+            csv_path.write_text("\n".join(old_lines + [new_row]) + "\n",
+                                encoding="utf-8-sig")
+            print(f"  기록: results\\{csv_path.name} [{p['label']}]")
+            # 보고표 자동 동기화 — 측정할 때마다 xlsx 갱신
+            try:
+                import stop_report
+                stop_report.generate()
+            except SystemExit as e:      # xlsx가 엑셀에 열려 있으면 등
+                print(f"  !! 보고표 자동 갱신 실패: {e}")
+                print("     (엑셀 닫고 python tools\\stop_report.py 로 수동 갱신)")
+            except Exception as e:       # noqa: BLE001
+                print(f"  !! 보고표 자동 갱신 실패: {e}")
+        except (g.CliError, DmmError, OSError) as e:
+            print(f"!! STOP 측정 실패: {e}")
+        finally:
+            sys.stdout, sys.stderr = old
+            self.root.after(0, lambda: (
+                self.stopcur_btn.configure(state="normal"),
+                self.run_btn.configure(state="normal")))
 
     def self_cal_clicked(self):
         if not messagebox.askokcancel(
@@ -1015,7 +1234,7 @@ class App:
     def _resolve_next_dut(self, excel: Path) -> int:
         """다음 빈 DUT 블록 번호 (없으면 자동 확장)."""
         wb = self._load_report(excel)
-        ws = wb[g.SHEET_NAME] if g.SHEET_NAME else wb.active
+        ws = g._get_sheet(wb)
         dut = g.find_next_empty_dut(ws)
         duts = _scan_duts(ws)
         wb.close()
@@ -1031,7 +1250,7 @@ class App:
         """DUT 블록 헤더에 온도+런 라벨: '... DUT#7 @-40C [0723_1706]'
         런 태그 = results/sweeps/<런폴더> 역추적용."""
         wb = self._load_report(excel)
-        ws = wb[g.SHEET_NAME] if g.SHEET_NAME else wb.active
+        ws = g._get_sheet(wb)
         ci, _ = g.locate_dut_columns(ws, dut)
         cell = ws.cell(row=g.HEADER_ROW, column=ci)
         base = re.sub(r"\s*@.*$", "", str(cell.value or f"DUT#{dut}"))
@@ -1350,7 +1569,7 @@ class App:
 
     def _ensure_dut_block(self, excel: Path, dut: int):
         wb = self._load_report(excel)
-        ws = wb[g.SHEET_NAME] if g.SHEET_NAME else wb.active
+        ws = g._get_sheet(wb)
         duts = _scan_duts(ws)
         if not duts:
             raise SystemExit(f"row {g.HEADER_ROW}에서 DUT# 헤더를 못 찾았어요")
@@ -1408,11 +1627,12 @@ class App:
         excel = p["excel"]
         # 검증용 사본이 없으면 원본에서 자동 생성 (원본은 불변)
         g.ensure_validation_workbook(excel, g.TEMPLATE_XLSX)
+        g.ensure_iface_sheet(excel)   # I2C 칩이면 '<시트>_I2C' 전용 시트에 기록
 
         dut = p["dut"]
         if dut is None:
             wb = self._load_report(excel)
-            ws = wb[g.SHEET_NAME] if g.SHEET_NAME else wb.active
+            ws = g._get_sheet(wb)
             dut = g.find_next_empty_dut(ws)
             duts = _scan_duts(ws)
             wb.close()

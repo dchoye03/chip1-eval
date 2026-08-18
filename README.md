@@ -41,6 +41,21 @@ automation.
   two-point DAC calibration wizard with pass/fail verification, ESPEC
   thermal-chamber driver (RS485 / Prologix GPIB) and a temperature-sweep state
   machine with a mock chamber + fake clock for hardware-free unit tests.
+- **I2C chip-variant support** (`app/chip1a_i2c.c`) — the same register map
+  behind a bit-banged I2C master on the same two wires; `iface spi|i2c`
+  switches at runtime and `wr/rr/rd/id` route transparently. Push-pull SCL
+  drive defeats a board pull-down that stalls open-drain clocking.
+- **Power-down (STOP) current test bench** — firmware sequences the chip into
+  its shutdown mode with three SCK drive strategies (`stop pd` internal
+  pull-up / `ext` external pull-up / `pp` push-pull for a level shifter),
+  while a Rigol DM3058E DMM in series with VDD is read over USBTMC
+  (`tools/dmm_dm3058.py`, mock mode included). The GUI adds smart
+  settle-detection (waits out the line-charge decay), per-sample CSV history,
+  and auto-regenerates a pass/fail Excel report (`tools/stop_report.py`) with
+  a criteria-based summary sheet — measured values survive regeneration.
+- **Dual supply conditions** — 3.3 V matched-level automation today, 5 V via
+  level shifter later: the GUI VDD selector tags every CSV row and the report
+  splits conditions into separate sheets automatically.
 
 ## Layout
 
@@ -67,8 +82,9 @@ STM32_Programmer_CLI -c port=SWD mode=UR -w build\Debug\CHIP1.elf -v -rst
 ```powershell
 pip install -r requirements.txt
 python tools\chip1_autotest.py     # CLI test runner
-python tools\chip1_gui.pyw         # GUI (tests, cal wizards, temp sweep)
+python tools\chip1_gui.pyw         # GUI (tests, cal wizards, temp sweep, STOP current)
 python tools\test_temp_sweep.py     # sweep state-machine unit tests (no HW)
+python tools\stop_report.py         # STOP-current CSV -> pass/fail Excel report
 ```
 
 Console: ST-Link VCP, 115200 8N1 — type `help` for the command list.

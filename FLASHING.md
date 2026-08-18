@@ -63,8 +63,8 @@ CHIP1/
 & "C:\ST\STM32CubeCLT_1.22.0\STM32CubeProgrammer\bin\STM32_Programmer_CLI.exe" -c port=SWD mode=UR
 ```
 
-출력의 `Board` / `Device name` 확인:
-- **NUCLEO-H533RE, STM32H533 (Device ID 0x478)**
+출력의 `Board` / `Device name` 확인. 새 개발 보드:
+- **NUCLEO-H533RE, STM32H533 (Device ID 0x478), ST-Link SN `003400203133511735333335`**
 
 ### ⚠ ST-Link 여러 개 연결 시 (기존 테스트 보드 공존)
 
@@ -75,7 +75,26 @@ CHIP1/
 & "C:\ST\STM32CubeCLT_1.22.0\STM32CubeProgrammer\bin\STM32_Programmer_CLI.exe" -l
 
 # SN 지정 연결/플래시
-... -c port=SWD sn=<ST-LINK 시리얼> mode=UR -w ... -v -rst
+... -c port=SWD sn=003400203133511735333335 mode=UR -w ... -v -rst
+```
+
+## 기존 보드 플래시 백업 (덤프)
+
+**절대 규칙: 백업 완료 전에는 어떤 보드에도 플래싱 금지 (SPEC.md §0)**
+
+```powershell
+# 보드별로 파일명 구분해서 저장 (-u = 디바이스 → 파일 읽기)
+& "C:\ST\STM32CubeCLT_1.22.0\STM32CubeProgrammer\bin\STM32_Programmer_CLI.exe" -c port=SWD mode=UR -u 0x08000000 0x80000 "backup\dac_board_backup.bin"
+& "C:\ST\STM32CubeCLT_1.22.0\STM32CubeProgrammer\bin\STM32_Programmer_CLI.exe" -c port=SWD mode=UR -u 0x08000000 0x80000 "backup\test_board_backup.bin"
+```
+
+- `0x80000` = 512KB. 기존 보드 MCU의 플래시 크기에 맞게 조정
+  (연결 시 출력되는 flash size 확인. 크게 잡으면 에러 나므로 칩 크기 이하로).
+
+백업 복원 (원상복구):
+
+```powershell
+... -c port=SWD mode=UR -w "...\backup\test_board_backup.bin" 0x08000000 -v -rst
 ```
 
 ## 캘 값 삭제 (플래시 캘 저장소 소거 — 미캘 시연/재캘용)
@@ -96,8 +115,9 @@ ch2=none`을 반환하고 GUI가 "⚠ 미캘" 안내를 띄운다.
 
 ## 샘플 캡처 → CSV (tools/chip1_capture.py)
 
-`rd` 결과를 CSV로 저장 + 통계(mean/stdev/p-p/drift) 출력.
-의존성: `pip install -r requirements.txt` (pyserial/openpyxl).
+`rd` 결과를 CSV로 저장 + 통계(mean/stdev/p-p/drift) 출력. 기존 셋업 비교용.
+의존성: 없음 — pyserial/openpyxl은 `tools/_vendor`에 내장 (2026-07-23부터).
+파이썬 3.x만 있으면 됨. (시스템에 pip 설치본이 있으면 그쪽을 우선 사용)
 
 ```powershell
 # Internal Short 노이즈 1024샘플 (10SPS, PGA x64, 세틀링 60초 대기)
@@ -126,10 +146,13 @@ python tools\chip1_autotest.py
 
 # 포트/DUT/세틀링 지정
 python tools\chip1_autotest.py --port COM5 --dut 3 --settle-sec 60
+
+# CHIP1A (I2C 버전 칩) 테스트 — 배선 동일, 인터페이스만 전환
+python tools\chip1_autotest.py --iface i2c
 ```
 
-- 첫 실행 시 `template\report_template.xlsx`를 복사해
-  **CHIP1_ADC_validation.xlsx**를 만든다 (템플릿 원본은 수정 안 함).
+- 첫 실행 시 `old test\26.7.14.adc.xlsx`를 복사해 데이터만 비운
+  **CHIP1_ADC_validation.xlsx**를 만든다 (원본은 절대 수정 안 함).
 - CSV는 `captures\dut{n}_{mode}_{ts}.csv`로 병행 저장.
 - 전압 (팀 확정 표준): ch1=1.52V(AINP)/ch2=1.48V(AINN) — 차동 +40mV,
   구 엑셀 데이터와 부호까지 일치 (Channel A 평균 +6.9M 근처 기대).
@@ -139,6 +162,10 @@ python tools\chip1_autotest.py --port COM5 --dut 3 --settle-sec 60
 자동 테스트의 GUI판. 더블클릭 실행 (콘솔 없음, 출력은 로그 창).
 
 - 전압(µV)/샘플 수/세틀링 대기/DUT#/COM 포트를 입력창에서 조정
+- **Interface (칩 종류)** 셀렉션: SPI(CHIP1, 기본) / I2C(CHIP1A) — 선택
+  즉시 Run/스윕/캘/보드확인 전 경로에 적용 (펌웨어 `iface` 명령 필요)
+- 결과 시트 자동 분리: SPI=기본 시트 / I2C=`<시트>_I2C` (상온), 스윕
+  시트명 `_I2C` 태그 — 어떤 인터페이스 칩의 결과인지 시트로 구별됨
 - DAC cal 계수 자동 입력, 검증 워크북 자동 생성/기입, 완료 시 엑셀 자동 열기
 - Internal Short는 STD/ENOB, Channel A는 평균/Vin/정확도를 즉석 요약
 - 엑셀 블록이 모자라면 DUT#11, #12... 블록을 템플릿 복사로 자동 확장
@@ -152,6 +179,38 @@ python tools\chip1_autotest.py --port COM5 --dut 3 --settle-sec 60
   **Advanced… 버튼** = 외부 2점 위저드 (D1을 A3/A4에 임시 배선, 셀프캘 검증
   실패 시 백업. 끝나면 임시 배선 원상복구 필수)
 - 스윕 옵션 "온도별 자동 셀프캘" (기본 ON): 온도마다 `meas cal` 재실행
+
+## STOP 전류 측정 (GUI "Stop Current" 섹션 — 패키지 시료 비교)
+
+파워다운 전류를 DM3058E(USB)로 자동 측정. 시퀀스는 팀 테스트 플랜
+(SCK 0 → 2ms → SCK 1 → 500µs 유지 → VDD 전류) — SPEC.md §10.
+
+1. 배선: 칩을 캐리어 지그 소켓에 장착, Nucleo에서 SCK/GND 점퍼 (+SDA 선택),
+   DMM을 DVDD 공급선과 **직렬**(µA 단자, J207 자리)
+2. 의존성: **설치 불필요** — pyvisa 계열도 tools\_vendor 내장 (2026-08-11).
+   단 **PC마다 1회 DMM USB 드라이버**는 필요: Zadig → List All Devices →
+   "DM3000 SERIES"(1AB1 09C4) → WinUSB 설치. (NI-VISA 있는 PC는 생략)
+3. GUI에서 시료 라벨(예: 기존#1/신규#1)과 측정 횟수, **VDD 조건** 선택 →
+   **측정** 버튼 — 자동으로 깨우기+id 확인 → PD 진입 → 안정화 대기 →
+   N회 읽기 → **PD 유지로 종료** (깨우기 = 다음 측정 시 자동)
+   - **VDD 조건**: `3.3V (직결)` = 현행 표준 (내부 풀업) / `5V (레벨시프터)`
+     = SCK·SDA 레벨시프터 장착 시 (펌웨어 `stop pd pp` 사용) — 결과는
+     보고표 `5V_자동` 시트로 분리
+4. 결과: `results\stop_current.csv` 누적 (평균/min/max µA + vdd 조건) —
+   기존 3개 vs 신규 3개 라벨별로 쌓아서 비교
+5. DMM 없이 흐름 리허설: DMM 칸에 `MOCK`
+
+터미널 수동 실행: `stop pd`(내부 풀업, 3.3V) / `stop pd ext`(외부 풀업,
+5V+캡) / `stop pd pp`(푸시풀 — 레벨시프터용) → DMM 읽기 → `stop wake`
+
+보고표 생성 (테스트 플랜 형식 엑셀):
+
+```powershell
+python tools\stop_report.py    # stop_current.csv -> STOP_current_report.xlsx
+```
+
+- 시료 6개(기존#1~3/신규#1~3) + `빈소켓_baseline` 라벨 측정 후 실행하면
+  베이스라인 차감·그룹 평균·변화율까지 자동 계산. 측정 추가 시 재실행 = 갱신.
 
 ## 온도 스윕 (GUI "Temperature Sweep" 섹션)
 
@@ -198,3 +257,15 @@ python tools\test_temp_sweep.py    # MockChamber + 가상 시계, 5개 테스트
 - 2026-07-24: **보드 내 캘 영구저장** (`dac cal save`/`uid` — **재플래시 필요**,
   링커 504K로 변경). GUI 보드 감지(UID+미캘 안내), 엑셀 블록 메타 실측 기입,
   config/board_registry.json (PC별 보드 이력)
+- 2026-07-29: **CHIP1A(I2C) 지원** — 펌웨어 `iface`/`iscan` 명령(**재플래시
+  필요**), autotest `--iface`, GUI Interface 셀렉션 + 로고.
+  실기 검증: A칩 EVM에서 iscan 0x2A + id 0x9210 확인 (EVM R14 풀다운은
+  SCL 푸시풀 구동으로 해결 — SPEC.md §3.5)
+- 2026-08-07: 엑셀 시트 인터페이스별 분리(`*_SPI`/`*_I2C`, 중복 생성 방지),
+  블록 헤더 날짜 실측 갱신
+- 2026-08-10: **STOP 전류 측정** — 펌웨어 `stop pd|wake`(**재플래시 필요**),
+  DM3058E 드라이버(tools/dmm_dm3058.py), GUI "Stop Current" 섹션,
+  results/stop_current.csv (SPEC.md §10)
+- 2026-08-11: STOP 측정 최종 구성 — 보드 분리(오프셋≈0), SCK 오픈드레인
+  구동(캐리어 내장 풀업으로 High=5V, **재플래시 필요**), 보고표 생성기
+  tools/stop_report.py (상세: (내부 기록))

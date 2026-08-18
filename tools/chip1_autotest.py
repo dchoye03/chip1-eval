@@ -1,7 +1,7 @@
 """
 CHIP1 24bit ADC characterization automation — v4 펌웨어(내장 DAC 통합) 이식판.
 
-구판(레거시 2보드 셋업용)과의 차이:
+구판(old test/chip1_autotest.py)과의 차이:
   - 보드 1개 (Nucleo-H533RE 통합) — DAC 보드/칩선택 메뉴/보드 식별 로직 삭제
   - 깨끗한 CLI: NUL/ANSI 정리 불필요, 모든 명령이 'OK'/'ERR ...'로 종료
   - rr 응답 = '0x??' 줄 + 'OK' 줄
@@ -20,9 +20,9 @@ Usage:
     python tools/chip1_autotest.py --dut 1
     python tools/chip1_autotest.py --port COM5 --dut 3 --settle-sec 60
 
-엑셀: 첫 실행 시 template/report_template.xlsx를 복사해 검증 워크북
-(CHIP1_ADC_validation.xlsx)을 만들고, 이후 그 워크북의 DUT#n 블록에
-기입한다 (수식/통계 행 유지, 템플릿 원본은 수정 안 함).
+엑셀: 기존 리포트(old test/26.7.14.adc.xlsx)는 건드리지 않는다. 첫 실행 시
+같은 구조의 검증용 사본(CHIP1_ADC_validation.xlsx)을 만들고(데이터 영역만
+비움, 수식/통계 행 유지) 이후 그 사본의 DUT#n 블록에 기입한다.
 """
 
 import argparse
@@ -79,7 +79,8 @@ RESULTS_DIR = PROJECT_ROOT / "results"
 SWEEPS_DIR = RESULTS_DIR / "sweeps"            # 스윕 1회 = 폴더 1개 (타임스탬프)
 MANUAL_DIR = RESULTS_DIR / "manual"            # 단발 캡처 (capture.py / Run test)
 
-TEMPLATE_XLSX = PROJECT_ROOT / "template" / "report_template.xlsx"
+TEMPLATE_XLSX = _resolve(PROJECT_ROOT / "old test" / "26.7.14.adc.xlsx",
+                         PROJECT_ROOT / "docs" / "26.7.14.adc_legacy_DAC1220.xlsx")
 EXCEL_PATH = _resolve(RESULTS_DIR / "CHIP1_ADC_validation.xlsx",
                       PROJECT_ROOT / "CHIP1_ADC_validation.xlsx")
 CSV_DIR = MANUAL_DIR                           # save_csv 기본 위치
@@ -142,10 +143,30 @@ def resync(ser: serial.Serial, tries: int = 3) -> bool:
     return False
 
 
+# 칩 인터페이스: 'spi' = CHIP1(2선 펄스, 기본) / 'i2c' = CHIP1A(I2C 0x2A).
+# GUI 셀렉션/CLI --iface가 set_iface()로 설정하면 open_port가 보드에 반영한다.
+IFACE = "spi"
+
+
+def set_iface(iface: str):
+    global IFACE
+    IFACE = "i2c" if str(iface).strip().lower() == "i2c" else "spi"
+
+
 def open_port(port_name: str) -> serial.Serial:
     ser = serial.Serial(port_name, BAUD, timeout=0.2)
     time.sleep(0.3)
     resync(ser)                        # 이전 세션 잔여 상태 정리 (항상 수행)
+    # 인터페이스 선택 반영. 이전 세션이 i2c로 두고 끊겼을 수 있어 spi도 명시
+    # 전송 (iface 명령이 없는 구펌웨어면 spi에 한해 조용히 무시 — 부팅 기본값
+    # 이 spi라 동작 동일. i2c 요청인데 구펌웨어면 에러를 그대로 낸다).
+    try:
+        send_cmd(ser, f"iface {IFACE}", quiet=True,
+                 timeout_s=3.0)        # spi 복귀는 펌웨어가 350ms 웨이크 대기
+    except CliError:
+        if IFACE != "spi":
+            raise CliError("이 펌웨어에 iface 명령이 없습니다 — I2C(CHIP1A) "
+                           "모드는 최신 펌웨어 플래시 후 사용 가능")
     return ser
 
 
@@ -512,8 +533,144 @@ def save_csv(values: list[int], dut: int, mode: str,
     return path
 
 
+def _i2c_sheet_name(wb) -> str:
+    """I2C 결과 시트 이름 결정.
+
+    핵심 규칙: **이미 존재하는 '*_I2C' 시트가 있으면 그걸 재사용** — 활성
+    탭이 무엇이든 중복 시트를 만들지 않는다 (실사고: 활성=260410_SPI 상태에서
+    260807_I2C가 있는데 260410_SPI_I2C를 새로 만듦). 없을 때만 활성 시트
+    이름 기반으로 짓되, '_SPI' 접미는 떼고 '_I2C'를 붙인다."""
+    active = wb.active.title
+    if active.endswith("_I2C"):
+        return active
+    existing = [s for s in wb.sheetnames if s.endswith("_I2C")]
+    if existing:
+        return existing[0]
+    base = active[:-4] if active.endswith("_SPI") else active
+    return base + "_I2C"
+
+
+def _spi_sheet_name(wb) -> str:
+    """SPI 결과 시트 이름 결정 (_i2c_sheet_name과 대칭): 기존 '*_SPI' 시트
+    재사용 우선, 없으면 일반 시트 이름 + '_SPI'."""
+    active = wb.active.title
+    if active.endswith("_SPI"):
+        return active
+    existing = [s for s in wb.sheetnames if s.endswith("_SPI")]
+    if existing:
+        return existing[0]
+    base = active[:-4] if active.endswith("_I2C") else active
+    if base.startswith("SW_"):
+        for s in wb.sheetnames:
+            if not s.startswith("SW_") and not s.endswith("_I2C"):
+                base = s[:-4] if s.endswith("_SPI") else s
+                break
+    return base + "_SPI"
+
+
+def _spi_sheet(wb):
+    """SPI 결과 시트: '*_SPI' 시트 우선 (ensure_iface_sheet가 개명해 둠).
+    아직 개명 전 워크북 폴백: 활성(비 I2C) → base → 비스윕 일반 시트."""
+    name = _spi_sheet_name(wb)
+    if name in wb.sheetnames:
+        return wb[name]
+    ws = wb.active
+    if not ws.title.endswith("_I2C"):
+        return ws
+    base = ws.title[:-4]
+    if base in wb.sheetnames:
+        return wb[base]
+    for s in wb.sheetnames:
+        if not s.endswith("_I2C") and not s.startswith("SW_"):
+            return wb[s]
+    return ws
+
+
 def _get_sheet(wb):
-    return wb[SHEET_NAME] if SHEET_NAME else wb.active
+    """대상 시트 라우팅 — 칩 인터페이스별 결과 분리의 단일 지점.
+
+    - SHEET_NAME 명시(스윕 시트/--sheet) → 그대로 (스윕은 시트명 자체에
+      I2C 태그가 붙음, create_sweep_sheet 참조)
+    - 기본(상온): SPI = 일반 시트(_I2C 회피) / I2C = 기존 '*_I2C' 시트 재사용
+      (ensure_iface_sheet가 미리 생성해 둠 — 없으면 명확히 실패)
+    """
+    if SHEET_NAME:
+        return wb[SHEET_NAME]
+    if IFACE == "i2c":
+        name = _i2c_sheet_name(wb)
+        if name not in wb.sheetnames:
+            raise CliError(f"I2C 결과 시트({name})가 없음 — "
+                           "테스트 시작 경로에서 ensure_iface_sheet() 필요")
+        return wb[name]
+    return _spi_sheet(wb)
+
+
+def ensure_iface_sheet(excel_path: Path):
+    """상온 결과 시트를 인터페이스별 이름으로 보장 (테스트 시작 시 호출).
+
+    - i2c: '*_I2C' 시트 재사용, 없으면 SPI 시트 레이아웃 복제로 생성
+    - spi: '*_SPI' 시트 재사용, 없으면 기본 시트를 '<이름>_SPI'로 **개명**
+      (기존 데이터 보존 — 복제/신규 생성 아님)"""
+    if SHEET_NAME:
+        return None
+    from openpyxl import load_workbook
+
+    if IFACE != "i2c":
+        wb = load_workbook(excel_path)
+        name = _spi_sheet_name(wb)
+        if name in wb.sheetnames:
+            wb.close()
+            return name
+        ws = wb.active
+        if ws.title.startswith("SW_") or ws.title.endswith("_I2C"):
+            for s in wb.sheetnames:
+                if not s.startswith("SW_") and not s.endswith("_I2C"):
+                    ws = wb[s]
+                    break
+            else:
+                wb.close()
+                return None            # 개명할 일반 시트가 없음 (비정상 구성)
+        old = ws.title
+        ws.title = old + "_SPI"
+        wb.save(excel_path)
+        wb.close()
+        print(f"SPI 결과 시트 개명: {old} -> {old}_SPI (데이터 보존)")
+        return old + "_SPI"
+
+    wb = load_workbook(excel_path)
+    name = _i2c_sheet_name(wb)          # 기존 *_I2C 시트 재사용 (중복 방지)
+    if name in wb.sheetnames:
+        wb.close()
+        return name
+
+    base = _spi_sheet(wb)               # 레이아웃 원본 = SPI 시트
+    ws = wb.copy_worksheet(base)
+    ws.title = name
+
+    def is_formula(cell):
+        return cell.data_type == "f" or (isinstance(cell.value, str)
+                                         and cell.value.startswith("="))
+
+    for _dut, c in _find_dut_blocks(ws):
+        for col in (c, c + 1):
+            for r in range(DATA_START_ROW, DATA_START_ROW + N_SAMPLES):
+                if ws.cell(row=r, column=col).value is not None:
+                    ws.cell(row=r, column=col).value = None
+            for r in (META_ROW_VDD, META_ROW_AVDD, META_ROW_PGA, META_ROW_REG):
+                cell = ws.cell(row=r, column=col)
+                if not is_formula(cell):
+                    cell.value = None
+        ws.cell(row=META_ROW_ACTUAL_VIN, column=c + 1).value = None
+        c17 = ws.cell(row=META_ROW_VIN_MV, column=c + 1)
+        if not is_formula(c17):
+            c17.value = None
+        hcell = ws.cell(row=HEADER_ROW, column=c)
+        if isinstance(hcell.value, str):
+            hcell.value = re.sub(r"\s*@.*$", "", hcell.value)
+
+    wb.save(excel_path)
+    print(f"I2C 전용 시트 생성: {name} (기본 시트 레이아웃 복제, 데이터 비움)")
+    return name
 
 
 def _find_dut_blocks(ws) -> list[tuple[int, int]]:
@@ -593,6 +750,22 @@ def write_block_meta(excel_path: Path, dut: int,
     wb = load_workbook(excel_path)
     ws = _get_sheet(wb)
     col_int, col_cha = locate_dut_columns(ws, dut)
+
+    # 블록 안에서도 인터페이스가 보이게 레지스터 표기에 태그 (시트 분리와 별개)
+    if IFACE == "i2c" and "I2C" not in reg_note:
+        reg_note = (reg_note[:-1] + ", I2C)") if reg_note.endswith(")") \
+                   else reg_note + " I2C"
+
+    # 블록 헤더 날짜를 실제 테스트 날짜로 갱신 (레거시 템플릿의 박제 날짜
+    # 대체). 형식 'YYYY-MM-DD DUT#n[ @온도 [태그]]' — 접미(@/[])는 보존.
+    hcell = ws.cell(row=HEADER_ROW, column=col_int)
+    hval = str(hcell.value or f"DUT#{dut}")
+    today = datetime.now().strftime("%Y-%m-%d")
+    if re.match(r"\s*\d{4}-\d{2}-\d{2}", hval):
+        hval = re.sub(r"^\s*\d{4}-\d{2}-\d{2}", today, hval, count=1)
+    else:
+        hval = f"{today} {hval.strip()}"
+    hcell.value = hval
 
     def put(row, col, value):
         cell = ws.cell(row=row, column=col)
@@ -706,11 +879,15 @@ def main():
     ap.add_argument("--sheet", default=None, help="시트 이름 (기본: active)")
     ap.add_argument("--settle-sec", type=float, default=0,
                     help="설정 후 캡처 전 추가 대기 초 (과도 드리프트 실측 시 60 권장)")
+    ap.add_argument("--iface", choices=("spi", "i2c"), default="spi",
+                    help="칩 인터페이스: spi=CHIP1(기본), i2c=CHIP1A")
     args = ap.parse_args()
     if args.sheet:
         SHEET_NAME = args.sheet
+    set_iface(args.iface)
 
     ensure_validation_workbook(args.excel, TEMPLATE_XLSX)
+    ensure_iface_sheet(args.excel)      # i2c면 '<시트>_I2C' 전용 시트 보장
 
     dut = args.dut
     if dut is None:
