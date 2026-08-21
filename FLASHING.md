@@ -1,4 +1,4 @@
-# 빌드 / 플래시 명령 레퍼런스
+﻿# 빌드 / 플래시 명령 레퍼런스
 
 PC측 도구 명령 모음. 새 명령이 생기면 이 파일에 추가할 것.
 (펌웨어 UART 명령은 SPEC.md 섹션 2 참조)
@@ -193,9 +193,10 @@ python tools\chip1_autotest.py --iface i2c
 3. GUI에서 시료 라벨(예: 기존#1/신규#1)과 측정 횟수, **VDD 조건** 선택 →
    **측정** 버튼 — 자동으로 깨우기+id 확인 → PD 진입 → 안정화 대기 →
    N회 읽기 → **PD 유지로 종료** (깨우기 = 다음 측정 시 자동)
-   - **VDD 조건**: `3.3V (직결)` = 현행 표준 (내부 풀업) / `5V (레벨시프터)`
-     = SCK·SDA 레벨시프터 장착 시 (펌웨어 `stop pd pp` 사용) — 결과는
-     보고표 `5V_자동` 시트로 분리
+   - **VDD = 5V(풀업) 고정** (2026-08-18 단순화): 전원 5V 급전 + 4.7k
+     풀업(J206 캡 또는 외부 저항) 전제, `stop pd ext` 자동 사용. 3.3V/
+     레벨시프터 모드는 GUI에서 제거 — 펌웨어 명령(stop pd / stop pd pp)은
+     유지되어 필요 시 터미널로 가능
 4. 결과: `results\stop_current.csv` 누적 (평균/min/max µA + vdd 조건) —
    기존 3개 vs 신규 3개 라벨별로 쌓아서 비교
 5. DMM 없이 흐름 리허설: DMM 칸에 `MOCK`
@@ -206,11 +207,30 @@ python tools\chip1_autotest.py --iface i2c
 보고표 생성 (테스트 플랜 형식 엑셀):
 
 ```powershell
-python tools\stop_report.py    # stop_current.csv -> STOP_current_report.xlsx
+python tools\stop_report.py         # stop_current.csv -> STOP_current_report.xlsx
+python tools\stop_report.py 로트B   # 런(그룹)별: stop_current_로트B.csv -> ..._로트B.xlsx
 ```
 
-- 시료 6개(기존#1~3/신규#1~3) + `빈소켓_baseline` 라벨 측정 후 실행하면
-  베이스라인 차감·그룹 평균·변화율까지 자동 계산. 측정 추가 시 재실행 = 갱신.
+- 라벨 규칙('기존*'=기존 그룹/'빈소켓'=베이스라인/그 외=신규 그룹)대로 측정 후
+  실행하면 베이스라인 차감·그룹 평균·판정까지 자동 계산. 그룹 크기는 가변 —
+  시료 행은 실제 측정된 라벨로 구성. 측정 추가 시 재실행 = 갱신 (수동 입력 보존).
+
+**새 테스트 그룹 (2026-08-18):**
+
+- **STOP**: GUI "런 이름" 입력 → CSV/보고표가 `stop_current_<이름>.csv` /
+  `STOP_current_report_<이름>.xlsx`로 완전 분리 (빈칸 = 기본 캠페인).
+  이름 지정 런의 요약 시트는 기준(<10µA)으로 PASS/FAIL 자동 판정.
+- **보고표 파일 직접 지정 (2026-08-18)**: GUI "보고표 파일" 찾아보기로 임의 xlsx 선택/생성 — CSV도 같은 이름(.csv)으로 짝 저장, 런 이름보다 우선. CLI: `python tools\stop_report.py 경로\파일.xlsx`.
+- **VDD 5V(풀업) 고정 (2026-08-18)**: GUI STOP 측정은 항상 `stop pd ext`
+  (전원 5V + 4.7k 풀업 전제). 이전의 3.3V/레벨시프터 선택지는 UI에서 제거
+  (펌웨어 `stop pd`/`stop pd pp`는 터미널용으로 잔존).
+- **ADC (Run test)**: GUI "결과 시트" 입력 → 그 이름의 시트에 기록 (없으면
+  기본 시트 레이아웃을 복제해 새 시트 자동 생성 — 데이터 비움, 수식 보존).
+  빈칸 = 기존 자동 라우팅(SPI/I2C 시트).
+- **빈 엑셀 자동 시딩 (2026-08-18)**: 대상 엑셀이 없거나, 사용자가 만든
+  **빈 통합문서**면 템플릿 레이아웃을 자동으로 채워 넣음. 값이 있는데 DUT
+  블록이 없는 파일은 데이터 보호를 위해 안내 후 중단. (STOP 보고표는 원래
+  CSV에서 전부 자동 생성이라 해당 없음)
 
 ## 온도 스윕 (GUI "Temperature Sweep" 섹션)
 
@@ -269,3 +289,4 @@ python tools\test_temp_sweep.py    # MockChamber + 가상 시계, 5개 테스트
 - 2026-08-11: STOP 측정 최종 구성 — 보드 분리(오프셋≈0), SCK 오픈드레인
   구동(캐리어 내장 풀업으로 High=5V, **재플래시 필요**), 보고표 생성기
   tools/stop_report.py (상세: (내부 기록))
+

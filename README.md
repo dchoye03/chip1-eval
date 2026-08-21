@@ -53,9 +53,21 @@ automation.
   settle-detection (waits out the line-charge decay), per-sample CSV history,
   and auto-regenerates a pass/fail Excel report (`tools/stop_report.py`) with
   a criteria-based summary sheet — measured values survive regeneration.
-- **Dual supply conditions** — 3.3 V matched-level automation today, 5 V via
-  level shifter later: the GUI VDD selector tags every CSV row and the report
-  splits conditions into separate sheets automatically.
+- **Multi-campaign test runs** — per-campaign result isolation: the ADC GUI
+  clones a fresh formula-preserving sheet for any named test group (array
+  formulas column-translated correctly), and the STOP bench pairs any
+  user-chosen report `.xlsx` with a same-name `.csv`. Blank sample labels
+  auto-increment (`DUT#n`), reports rebuild from CSV with values preserved,
+  and campaign reports use a compact per-chip pass/fail summary with
+  prefix-grouped statistics (naturally sorted).
+- **Blank-workbook seeding** — point a test at an empty user-created Excel
+  file and the template layout (DUT blocks, formulas, cleared dates) is
+  injected automatically; files with unrelated data are protected with a
+  clear error instead of being overwritten.
+- **Low-side current sensing option** — measuring in the ground return keeps
+  the supply rail stiff (no decoupling-recharge tail after power-down entry)
+  and excludes host-pin leakage from the measurement loop; readings settle
+  immediately.
 
 ## Layout
 

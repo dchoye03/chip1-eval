@@ -127,6 +127,7 @@ def _copy_block(ws, src_col: int, dst_col: int, new_dut: int):
     from openpyxl.formula.translate import Translator
     from openpyxl.utils import get_column_letter
     from openpyxl.worksheet.cell_range import CellRange
+    from openpyxl.worksheet.formula import ArrayFormula
 
     shift = dst_col - src_col
     for rng in list(ws.merged_cells.ranges):
@@ -151,7 +152,16 @@ def _copy_block(ws, src_col: int, dst_col: int, new_dut: int):
             if r >= g.DATA_START_ROW or isinstance(d, MergedCell):
                 continue
             v = s.value
-            if isinstance(v, str) and v.startswith("="):
+            if isinstance(v, ArrayFormula):
+                # 배열수식(r12 STDEV 등)은 문자열이 아니라 객체 — 그대로
+                # 복사하면 원본 열 범위를 계산해 ENOB까지 이전 블록 값이
+                # 나오는 버그 (2026-08-18 실사고). 수식 텍스트를 열 번역하고
+                # ref도 새 셀로 재지정한 새 객체를 만든다.
+                new_text = Translator(
+                    v.text or "", origin=s.coordinate).translate_formula(
+                    d.coordinate)
+                d.value = ArrayFormula(ref=d.coordinate, text=new_text)
+            elif isinstance(v, str) and v.startswith("="):
                 d.value = Translator(v, origin=s.coordinate).translate_formula(
                     d.coordinate)
             elif r == g.HEADER_ROW and isinstance(v, str):
@@ -443,8 +453,9 @@ class App:
                              text="Stop Current (파워다운 전류, DM3058E)",
                              padding=6)
         stf.pack(side="top", fill="x", pady=(6, 0))
-        ttk.Label(stf, text="시료 라벨").grid(row=0, column=0, sticky="w")
-        self.st_label = tk.StringVar(value="기존#1")
+        ttk.Label(stf, text="시료 라벨 (빈칸=DUT#자동)").grid(
+            row=0, column=0, sticky="w")
+        self.st_label = tk.StringVar(value="")
         ttk.Entry(stf, textvariable=self.st_label, width=12).grid(
             row=0, column=1, sticky="w", padx=(2, 6))
         ttk.Label(stf, text="측정 횟수").grid(row=0, column=2, sticky="e")
@@ -461,7 +472,13 @@ class App:
         self.stopcur_btn.grid(row=0, column=4, sticky="nswe", padx=(4, 0))
 
         def open_stop_report():
-            p = g.RESULTS_DIR / "STOP_current_report.xlsx"
+            xlsx = (self.st_xlsx.get() or "").strip()
+            if xlsx:
+                p = Path(xlsx)
+            else:
+                run = (self.st_run.get() or "").strip()
+                p = g.RESULTS_DIR / (f"STOP_current_report_{run}.xlsx" if run
+                                     else "STOP_current_report.xlsx")
             if p.exists():
                 os.startfile(p)   # ⚠ 열어둔 채 측정하면 자동 갱신 실패 (잠김)
             else:
@@ -471,19 +488,55 @@ class App:
             row=1, column=4, sticky="nswe", padx=(4, 0))
         # VDD 조건: 3.3V=현행 직결 자동화 / 5V=레벨시프터 장착 시 (시프터가
         # MCU 3.3V 신호를 칩측 5V로 변환 — 펌웨어 'stop pd pp' 사용)
-        ttk.Label(stf, text="VDD 조건").grid(row=2, column=0, sticky="w")
-        self.st_vdd = tk.StringVar(value="3.3V (직결)")
-        ttk.Combobox(stf, textvariable=self.st_vdd, state="readonly", width=18,
-                     values=["3.3V (직결)", "5V (레벨시프터)"]).grid(
-            row=2, column=1, columnspan=2, sticky="w", padx=(2, 6))
+        # VDD 조건 = 5V(풀업) 고정 — 테스트 플랜 기준 조건 (2026-08-18 단순화.
+        # 3.3V/레벨시프터 모드는 GUI에서 제거 — 펌웨어 명령은 유지되어
+        # 필요 시 터미널로 가능: stop pd / stop pd pp)
+        ttk.Label(stf, text="VDD: 5V (풀업 — stop pd ext)",
+                  foreground="dark blue").grid(
+            row=2, column=0, columnspan=3, sticky="w")
+        # 런(테스트 그룹) 이름 — 빈칸=기본 캠페인. 입력 시 CSV/보고표가
+        # stop_current_<이름>.csv / STOP_current_report_<이름>.xlsx 로 분리
+        ttk.Label(stf, text="런 이름").grid(row=2, column=3, sticky="e")
+        self.st_run = tk.StringVar(value="")
+        ttk.Entry(stf, textvariable=self.st_run, width=12).grid(
+            row=2, column=4, sticky="we", padx=(2, 0))
+        # 보고표 파일 직접 지정 (빈칸=자동: 기본/런 이름 규칙). 지정 시
+        # CSV도 같은 이름(.csv)으로 함께 저장 — ADC의 Excel 선택과 동일 UX
+        ttk.Label(stf, text="보고표 파일 (빈칸=자동)").grid(
+            row=3, column=0, columnspan=2, sticky="w")
+        self.st_xlsx = tk.StringVar(value="")
+        ttk.Entry(stf, textvariable=self.st_xlsx, width=24).grid(
+            row=3, column=2, columnspan=2, sticky="we", padx=(2, 6))
+
+        def browse_stop_xlsx():
+            path = filedialog.asksaveasfilename(
+                title="STOP 보고표 파일 선택/생성", initialdir=g.RESULTS_DIR,
+                defaultextension=".xlsx", confirmoverwrite=False,
+                filetypes=[("Excel 파일", "*.xlsx")])
+            if path:
+                self.st_xlsx.set(path)
+
+        ttk.Button(stf, text="찾아보기…", command=browse_stop_xlsx).grid(
+            row=3, column=4, sticky="nswe", padx=(4, 0))
         ttk.Label(stf, foreground="gray", justify="left", text=(
-            "라벨 규칙: '기존'으로 시작=기존 그룹 / '빈소켓'·'baseline' 포함="
-            "베이스라인 / 그 외=신규 그룹(시료 ID 권장, 예: 신규#1)\n"
+            "라벨 규칙: 빈칸=DUT#n 자동 번호 / '기존'으로 시작=기존 그룹 / "
+            "'빈소켓'·'baseline' 포함=베이스라인 / 그 외=신규 그룹\n"
             "같은 라벨 재측정 = 최신값으로 갱신. 측정마다 보고표 자동 갱신 "
             "(보고표 엑셀은 닫아둘 것). 결과: results\\stop_current.csv\n"
-            "VDD 5V는 레벨시프터(SCK·SDA 3.3↔5V 변환) 장착 후 선택 — 결과는 "
-            "보고표 '5V_자동' 시트로 분리 기록")).grid(
-            row=3, column=0, columnspan=5, sticky="w")
+            "5V 요건: 전원 5V 급전 + 4.7k 풀업을 5V↔CLK에 (J206 캡 또는 "
+            "외부 저항). 로그의 id 실패 경고는 정상 (5V에서 3.3V 신호)\n"
+            "보고표 파일 지정 시 CSV도 같은 이름(.csv)으로 그 옆에 저장 "
+            "(런 이름보다 우선)")).grid(
+            row=4, column=0, columnspan=5, sticky="w")
+
+        # ADC 결과 시트 지정 — 새 테스트 그룹용 (빈칸 = 기존 자동 라우팅.
+        # 새 이름 입력 시 기본 시트 레이아웃을 복제한 새 시트에 기록)
+        ttk.Label(frm, text="결과 시트 (빈칸=자동, 새 그룹명 입력 가능)").grid(
+            row=self._row, column=0, columnspan=2, sticky="w")
+        self.sheet_name = tk.StringVar(value="")
+        ttk.Entry(frm, textvariable=self.sheet_name, width=16).grid(
+            row=self._row, column=2, sticky="we")
+        self._row += 1
 
         # 보드 상태 표시줄 (연결 감지 — UID + 플래시 캘 유무)
         self.board_status = tk.StringVar(value="보드 상태: 미확인")
@@ -706,12 +759,42 @@ class App:
                 "STOP 전류 테스트는 SPI 칩 전용입니다.\n"
                 "Interface를 'SPI (CHIP1)'로 바꾼 뒤 실행하세요.")
             return
-        p = {"label": self.st_label.get().strip() or "unnamed",
+        run = "".join(ch for ch in (self.st_run.get() or "").strip()
+                      if ch.isalnum() or ch in "_-.")   # 파일명 안전화
+        # VDD 5V(풀업) 고정: 'stop pd ext' — 핀 해제, 4.7k 풀업이 5V로 올림.
+        # id는 3.3V 신호라 실패 정상 (소프트 경고로 진행)
+        pd_cmd = "stop pd ext"
+        xlsx = (self.st_xlsx.get() or "").strip()
+        label = self.st_label.get().strip()
+        if not label:
+            # 빈칸 = ADC의 DUT 자동 감지처럼, 해당 런/파일 CSV에서 다음
+            # DUT# 번호 자동 배정 (없으면 DUT#1부터)
+            if xlsx:
+                cp = Path(xlsx).with_suffix(".csv")
+            elif run:
+                cp = g.RESULTS_DIR / f"stop_current_{run}.csv"
+            else:
+                cp = g.RESULTS_DIR / "stop_current.csv"
+            nums = []
+            if cp.exists():
+                try:
+                    import csv as _csv
+                    with open(cp, encoding="utf-8-sig", newline="") as f:
+                        for row in _csv.DictReader(f):
+                            m = re.match(r"^DUT#(\d+)$",
+                                         (row.get("label") or "").strip())
+                            if m:
+                                nums.append(int(m.group(1)))
+                except OSError:
+                    pass
+            label = f"DUT#{(max(nums) + 1) if nums else 1}"
+        p = {"label": label,
              "n": n,
              "dmm": self.st_dmm.get().strip() or None,
-             # 5V(레벨시프터) = 'stop pd pp' (푸시풀 High — 시프터가 5V로
-             # 변환. TXB류 오토방향 시프터도 호환). 3.3V = 'stop pd' (내부 풀업).
-             "vdd": "5.0" if self.st_vdd.get().startswith("5") else "3.3"}
+             "run": run or None,
+             "xlsx": xlsx or None,      # 보고표 파일 직접 지정 (런보다 우선)
+             "pd_cmd": pd_cmd,
+             "vdd": "5.0"}
         self.stopcur_btn.configure(state="disabled")
         self.run_btn.configure(state="disabled")
         threading.Thread(target=self._stopcur_worker, args=(p,),
@@ -724,8 +807,9 @@ class App:
         old = (sys.stdout, sys.stderr)
         sys.stdout = sys.stderr = QueueWriter(self.q)
         try:
-            pd_cmd = "stop pd pp" if p["vdd"] == "5.0" else "stop pd"
-            print(f"=== STOP 전류 측정 [{p['label']}] — VDD {p['vdd']}V ===")
+            pd_cmd = p.get("pd_cmd") or "stop pd"
+            print(f"=== STOP 전류 측정 [{p['label']}] — VDD {p['vdd']}V "
+                  f"({pd_cmd}) ===")
             port = norm_port(self.port.get()) or g.find_port()
             dmm = DM3058(p["dmm"])
             print(f"  DMM: {dmm.idn}")
@@ -783,7 +867,13 @@ class App:
             avg = sum(vals) / len(vals)
             print(f"  결과: 평균 {avg:.3f} uA "
                   f"(min {min(vals):.3f} / max {max(vals):.3f}, n={len(vals)})")
-            csv_path = g.RESULTS_DIR / "stop_current.csv"
+            if p.get("xlsx"):
+                # 파일 직접 지정: CSV = 같은 이름 .csv (보고표 옆)
+                csv_path = Path(p["xlsx"]).with_suffix(".csv")
+            else:
+                csv_path = g.RESULTS_DIR / (
+                    f"stop_current_{p['run']}.csv" if p.get("run")
+                    else "stop_current.csv")
             # 헤더 자가복구: 파일이 없거나, 엑셀에서 내용을 지워 헤더가
             # 사라진 경우(실사고 — 보고표 KeyError 'label')에도 복원한다.
             header = ["datetime", "label", "n", "avg_uA",
@@ -807,11 +897,15 @@ class App:
                 " ".join(f"{x:.3f}" for x in vals), p["vdd"]])
             csv_path.write_text("\n".join(old_lines + [new_row]) + "\n",
                                 encoding="utf-8-sig")
-            print(f"  기록: results\\{csv_path.name} [{p['label']}]")
+            print(f"  기록: {csv_path.parent.name}\\{csv_path.name} "
+                  f"[{p['label']}]")
             # 보고표 자동 동기화 — 측정할 때마다 xlsx 갱신
             try:
                 import stop_report
-                stop_report.generate()
+                if p.get("xlsx"):
+                    stop_report.generate(csv=str(csv_path), out=p["xlsx"])
+                else:
+                    stop_report.generate(p.get("run"))
             except SystemExit as e:      # xlsx가 엑셀에 열려 있으면 등
                 print(f"  !! 보고표 자동 갱신 실패: {e}")
                 print("     (엑셀 닫고 python tools\\stop_report.py 로 수동 갱신)")
@@ -1626,8 +1720,17 @@ class App:
     def _run_test(self, p: dict):
         excel = p["excel"]
         # 검증용 사본이 없으면 원본에서 자동 생성 (원본은 불변)
-        g.ensure_validation_workbook(excel, g.TEMPLATE_XLSX)
-        g.ensure_iface_sheet(excel)   # I2C 칩이면 '<시트>_I2C' 전용 시트에 기록
+        # 결과 시트: 이름 지정 시 그 시트로. 새 파일/빈 파일이면 템플릿
+        # 기본 시트를 그 이름으로 개명(시트 1장으로 시작), 기존 파일이면
+        # 레이아웃 복제로 새 시트 생성. 빈칸 = 인터페이스별 자동 라우팅
+        sheet = (self.sheet_name.get() or "").strip()
+        g.ensure_validation_workbook(excel, g.TEMPLATE_XLSX,
+                                     sheet_name=sheet or None)
+        g.SHEET_NAME = sheet or None
+        if sheet:
+            g.ensure_named_sheet(excel, sheet)
+        else:
+            g.ensure_iface_sheet(excel)   # I2C 칩이면 '<시트>_I2C' 전용 시트
 
         dut = p["dut"]
         if dut is None:

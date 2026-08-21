@@ -11,14 +11,22 @@ results/STOP_current_report.xlsx 를 만든다:
 사용: python tools\\stop_report.py   (측정 추가 후 재실행하면 갱신)
 """
 import csv
+import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import chip1_autotest as g   # RESULTS_DIR, _vendor 부트스트랩 재사용
 
-CSV_PATH = g.RESULTS_DIR / "stop_current.csv"
-OUT_PATH = g.RESULTS_DIR / "STOP_current_report.xlsx"
+def csv_path(run: str | None = None) -> Path:
+    """런(테스트 그룹)별 CSV — run 없으면 기본 캠페인."""
+    return g.RESULTS_DIR / (f"stop_current_{run}.csv" if run
+                            else "stop_current.csv")
+
+
+def out_path(run: str | None = None) -> Path:
+    return g.RESULTS_DIR / (f"STOP_current_report_{run}.xlsx" if run
+                            else "STOP_current_report.xlsx")
 
 def is_baseline(label: str) -> bool:
     return "baseline" in label.lower() or "빈소켓" in label
@@ -35,11 +43,11 @@ def split_groups(rows: dict) -> tuple[list[str], list[str]]:
     return old, new
 
 
-def load_rows() -> dict[str, dict]:
-    if not CSV_PATH.exists():
-        sys.exit(f"측정 CSV 없음: {CSV_PATH} — GUI Stop Current부터 실행")
-    latest: dict[str, dict] = {}
-    with open(CSV_PATH, encoding="utf-8-sig", newline="") as f:
+def load_rows(path: Path) -> dict:
+    if not path.exists():
+        sys.exit(f"측정 CSV 없음: {path} — GUI Stop Current부터 실행")
+    latest: dict = {}
+    with open(path, encoding="utf-8-sig", newline="") as f:
         rdr = csv.DictReader(f)
         if rdr.fieldnames:                          # BOM/공백 방어
             rdr.fieldnames = [fn.lstrip("﻿").strip()
@@ -48,7 +56,10 @@ def load_rows() -> dict[str, dict]:
             sys.exit("CSV 헤더 손상 — GUI로 측정 1회 실행하면 자동 복구됨")
         for row in rdr:
             lab = (row.get("label") or "").strip()
-            vdd = (row.get("vdd") or "3.3").strip()   # 구버전 CSV = 3.3 취급
+            # vdd 정규화: "5"/"5.0"/공백 혼재(세션별 표기 차) → "5.0"/"3.3"
+            # 둘로 통일. 구버전 CSV(컬럼 없음) = 3.3 취급.
+            raw = (row.get("vdd") or "3.3").strip()
+            vdd = "5.0" if raw.startswith("5") else "3.3"
             if lab:
                 latest[(lab, vdd)] = row            # 같은 (라벨,전압)만 갱신
     return latest
@@ -87,17 +98,21 @@ MANUAL_SECTIONS = [
 ]
 
 
-def _load_manual_values() -> dict:
+_NON_LABEL = {"시료", "기존 평균", "신규 평균"}
+_NON_LABEL_PREFIX = ("①", "②", "STOP Procedure", "방법:")
+
+
+def _load_manual_values(path: Path) -> dict:
     """기존 보고표의 수동 시트들에서 사용자가 입력한 판독값/비고를 회수
-    (보고표 재생성 때 보존). 섹션 헤더(①/②) 이전 행은 STOP으로 간주하므로
-    구버전(STOP 표만 있던 레이아웃)도 그대로 읽힌다.
+    (보고표 재생성 때 보존). 라벨 행은 제외 목록 방식으로 판별하므로
+    임의 시료명(새 테스트 그룹)도 그대로 보존된다.
     {(시트, 섹션, 라벨): ([판독5개], 비고)}"""
     saved = {}
-    if not OUT_PATH.exists():
+    if not path.exists():
         return saved
     try:
         from openpyxl import load_workbook
-        wb = load_workbook(OUT_PATH)
+        wb = load_workbook(path)
         for name in MANUAL_SHEETS:
             if name not in wb.sheetnames:
                 continue
@@ -114,22 +129,24 @@ def _load_manual_values() -> dict:
                 if s.startswith("②"):
                     section = "normal"
                     continue
-                if s in MANUAL_ROWS:
-                    reads = [ws.cell(row=r, column=c).value
-                             for c in range(MANUAL_READ_COLS[0],
-                                            MANUAL_READ_COLS[1] + 1)]
-                    note = ws.cell(row=r, column=MANUAL_NOTE_COL).value
-                    if any(x is not None for x in reads) or note:
-                        saved[(name, section, s)] = (reads, note)
+                if s in _NON_LABEL or s.startswith(_NON_LABEL_PREFIX):
+                    continue
+                reads = [ws.cell(row=r, column=c).value
+                         for c in range(MANUAL_READ_COLS[0],
+                                        MANUAL_READ_COLS[1] + 1)]
+                note = ws.cell(row=r, column=MANUAL_NOTE_COL).value
+                if any(x is not None for x in reads) or note:
+                    saved[(name, section, s)] = (reads, note)
         wb.close()
     except Exception:                     # noqa: BLE001 - 보존 실패 시 빈 시트
         pass
     return saved
 
 
-def _build_manual_sheet(wb, name: str, cfg: dict, saved: dict):
+def _build_manual_sheet(wb, name: str, cfg: dict, saved: dict,
+                        old_labels: list, new_labels: list):
     """수동 측정 시트 1장 생성: STOP/Normal 두 표, 판독값만 손으로 넣으면
-    평균/베이스라인 차감은 수식이 계산."""
+    평균/베이스라인 차감은 수식이 계산. 시료 행은 그룹 목록(가변)에서 생성."""
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
 
@@ -157,40 +174,14 @@ def _build_manual_sheet(wb, name: str, cfg: dict, saved: dict):
             c.font = head_font
             c.border = box
             c.alignment = Alignment(horizontal="center")
-        # 행 구성: 기존 3 + 기존 평균 + 신규 3 + 신규 평균 + 빈소켓
-        rows_plan = (MANUAL_ROWS[:3] + ["기존 평균"] + MANUAL_ROWS[3:6]
-                     + ["신규 평균"] + MANUAL_ROWS[6:])
-        base_row = r + 2 + len(rows_plan) - 1       # 각 표의 마지막 = baseline
+        # 행 구성: 기존 그룹(+평균) + 신규 그룹(+평균) + 빈소켓 — 그룹 크기 가변
         grp_fill = PatternFill("solid", fgColor="E8EAF0")
+        n_rows = (len(old_labels) + (1 if old_labels else 0)
+                  + len(new_labels) + (1 if new_labels else 0) + 1)
+        base_row = r + 2 + n_rows - 1               # 각 표의 마지막 = baseline
         rr = r + 2
-        for label in rows_plan:
-            if label.endswith(" 평균"):             # 그룹 평균 행 (직전 3행)
-                first, last = rr - 3, rr - 1
-                c0 = ws.cell(row=rr, column=2, value=label)
-                c0.border = box
-                c0.font = Font(bold=True)
-                c0.fill = grp_fill
-                for c in range(3, 8):
-                    cell = ws.cell(row=rr, column=c)
-                    cell.border = box
-                    cell.fill = grp_fill
-                avg = ws.cell(row=rr, column=8,
-                              value=f"=IFERROR(AVERAGE(H{first}:H{last}),\"\")")
-                avg.border = box
-                avg.fill = grp_fill
-                avg.font = Font(bold=True)
-                avg.number_format = "0.000"
-                sub = ws.cell(row=rr, column=9,
-                              value=f"=IFERROR(H{rr}-$H${base_row},\"\")")
-                sub.border = box
-                sub.fill = grp_fill
-                sub.font = Font(bold=True)
-                sub.number_format = "0.000"
-                nc = ws.cell(row=rr, column=MANUAL_NOTE_COL)
-                nc.border = box
-                nc.fill = grp_fill
-                rr += 1
-                continue
+
+        def sample_row(label):
             ws.cell(row=rr, column=2, value=label).border = box
             reads, note = saved.get((name, key, label), ([None] * 5, None))
             for j in range(5):
@@ -212,7 +203,44 @@ def _build_manual_sheet(wb, name: str, cfg: dict, saved: dict):
             nc.border = box
             if note:
                 nc.value = note
+
+        def avg_row(title, first, last):
+            c0 = ws.cell(row=rr, column=2, value=title)
+            c0.border = box
+            c0.font = Font(bold=True)
+            c0.fill = grp_fill
+            for c in range(3, 8):
+                cell = ws.cell(row=rr, column=c)
+                cell.border = box
+                cell.fill = grp_fill
+            avg = ws.cell(row=rr, column=8,
+                          value=f"=IFERROR(AVERAGE(H{first}:H{last}),\"\")")
+            avg.border = box
+            avg.fill = grp_fill
+            avg.font = Font(bold=True)
+            avg.number_format = "0.000"
+            sub = ws.cell(row=rr, column=9,
+                          value=f"=IFERROR(H{rr}-$H${base_row},\"\")")
+            sub.border = box
+            sub.fill = grp_fill
+            sub.font = Font(bold=True)
+            sub.number_format = "0.000"
+            nc = ws.cell(row=rr, column=MANUAL_NOTE_COL)
+            nc.border = box
+            nc.fill = grp_fill
+
+        for group, gname in ((old_labels, "기존 평균"),
+                             (new_labels, "신규 평균")):
+            if not group:
+                continue
+            first = rr
+            for lb in group:
+                sample_row(lb)
+                rr += 1
+            avg_row(gname, first, rr - 1)
             rr += 1
+        sample_row("빈소켓_baseline")
+        rr += 1
         r = base_row + 3        # 표 사이 여백 2행
 
     widths = {2: 16, 3: 9, 4: 9, 5: 9, 6: 9, 7: 9, 8: 12, 9: 16, 10: 24}
@@ -506,22 +534,181 @@ FOOT_5 = ("* SCK/SDA = 레벨시프터 경유 (MCU 3.3V ↔ 칩 5V 변환) — G
           "조건 '5V (레벨시프터)' 선택, 펌웨어 `stop pd pp`(푸시풀 High) 사용")
 
 
-def generate():
+def _label_key(lab: str):
+    """시료 라벨 자연 정렬 (신규#2 < 신규#10)."""
+    m = re.search(r"(\d+)\s*$", lab)
+    return (re.sub(r"\d+\s*$", "", lab), int(m.group(1)) if m else -1)
+
+
+def _build_simple_summary(wb, all_rows, rows33, rows5, tag: str):
+    """심플 요약 (이름 런/직접 지정 파일용) — 칩별 데이터 표 + 판정만.
+
+    2026-08-18 사용자 피드백: 새 캠페인 파일에 비교 캠페인의 풀 구조(수동
+    시트·기존vs신규 매트릭스)가 따라오는 건 과함 — 데이터가 잘 보이는 표로."""
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    ws = wb.create_sheet("요약", 0)
+    thin = Side(style="thin")
+    box = Border(left=thin, right=thin, top=thin, bottom=thin)
+    head_fill = PatternFill("solid", fgColor="1F3864")
+    head_font = Font(color="FFFFFF", bold=True)
+    ok_fill = PatternFill("solid", fgColor="E2EFDA")
+    bad_fill = PatternFill("solid", fgColor="FCE4E4")
+    base_fill = PatternFill("solid", fgColor="EDEDED")
+    CRIT_UA = 10.0
+
+    ws.merge_cells("B2:G2")
+    t = ws.cell(row=2, column=2, value=f"STOP 전류 결과 — {tag}")
+    t.font = Font(bold=True, size=14, color="1F3864")
+    ws.cell(row=3, column=2, value=(
+        "판정 기준: VDD 5.0V STOP 누설 < 10 µA (칩 테스트 플랜). "
+        "3.3V 행은 참고. 차감 = 측정 − 빈소켓 베이스라인.")).font = \
+        Font(size=9, italic=True)
+
+    def base_of(rows):
+        return next((float(r["avg_uA"]) for k, r in rows.items()
+                     if is_baseline(k)), None)
+
+    base33, base5 = base_of(rows33), base_of(rows5)
+
+    hdr = ["시료", "조건", "측정 평균 (µA)", "차감 (µA)", "판정", "측정 시각"]
+    r0 = 5
+    for i, h in enumerate(hdr):
+        c = ws.cell(row=r0, column=2 + i, value=h)
+        c.fill = head_fill
+        c.font = head_font
+        c.border = box
+        c.alignment = Alignment(horizontal="center")
+
+    # 5V 먼저, 각 조건 안에서 베이스라인 → 시료(자연 정렬)
+    ordered = sorted(
+        all_rows.items(),
+        key=lambda kv: (kv[0][1] != "5.0", not is_baseline(kv[0][0]),
+                        _label_key(kv[0][0])))
+    r = r0 + 1
+    sums: dict[str, list] = {}
+    for (lab, vdd), d in ordered:
+        avg = float(d["avg_uA"])
+        base = base5 if vdd.startswith("5") else base33
+        is_b = is_baseline(lab)
+        sub = None if (is_b or base is None) else avg - base
+        grp = _label_key(lab)[0].strip(" #_-") or "시료"   # 접두어별 그룹
+        if is_b:
+            verdict, fill = "—", base_fill
+        elif vdd.startswith("5"):
+            v = sub if sub is not None else avg
+            verdict, fill = (("PASS", ok_fill) if v < CRIT_UA
+                             else (f"FAIL ({v / CRIT_UA:.0f}배)", bad_fill))
+            sums.setdefault((vdd, grp), []).append(v)
+        else:
+            verdict, fill = "참고", None
+            if sub is not None:
+                sums.setdefault((vdd, grp), []).append(sub)
+        vals = [lab, f"{float(vdd):.1f} V", avg,
+                sub if sub is not None else "—", verdict,
+                str(d.get("datetime", ""))[:16]]
+        for i, v in enumerate(vals):
+            cell = ws.cell(row=r, column=2 + i, value=v)
+            cell.border = box
+            cell.alignment = Alignment(horizontal="center")
+            if isinstance(v, float):
+                cell.number_format = "0.000"
+            if is_b:
+                cell.fill = base_fill
+            elif i == 4 and fill:
+                cell.fill = fill
+                cell.font = Font(bold=True)
+        r += 1
+
+    r += 1
+    for (vdd, grp) in sorted(sums, key=lambda k: (k[0] != "5.0", k[1])):
+        vals = sums[(vdd, grp)]
+        n_pass = sum(1 for v in vals if v < CRIT_UA)
+        line = (f"{float(vdd):.1f} V · {grp}: {len(vals)}개, 차감 평균 "
+                f"{sum(vals) / len(vals):.3f} µA")
+        if vdd.startswith("5"):
+            line += f", PASS {n_pass}/{len(vals)}"
+        ws.cell(row=r, column=2, value=line).font = Font(bold=True, size=10)
+        r += 1
+
+    widths = {2: 16, 3: 9, 4: 15, 5: 12, 6: 16, 7: 17}
+    for col, w in widths.items():
+        ws.column_dimensions[get_column_letter(col)].width = w
+
+
+def generate(run: str | None = None, csv: str | None = None,
+             out: str | None = None):
     """CSV → 보고표 생성. GUI가 측정 직후 자동 호출 (수동: main).
 
+    run = 테스트 그룹(런) 이름 — 그룹별로 stop_current_<run>.csv /
+    STOP_current_report_<run>.xlsx 로 완전 분리 (None = 기본 캠페인).
+    csv/out = **명시 경로 지정** (GUI '보고표 파일' 선택, 2026-08-18) —
+    지정 시 run 이름 규칙 대신 그 파일을 사용.
     CSV의 vdd 컬럼(없으면 3.3 취급)으로 조건을 분리 — 3.3V 행은 '3V3_자동',
     5V 행(레벨시프터 자동화)은 '5V_자동' 시트로. 5V 행이 없으면 5V_자동
-    시트는 생성하지 않는다."""
-    all_rows = load_rows()
+    시트는 생성하지 않는다. 수동 시트의 시료 행은 CSV·기존 입력에 등장한
+    라벨로 동적 구성 ('기존*'=기존 그룹, 그 외=신규 그룹)."""
+    cpath = Path(csv) if csv else csv_path(run)
+    opath = Path(out) if out else out_path(run)
+    all_rows = load_rows(cpath)
     rows33, rows5 = {}, {}
     for (lab, v), r in all_rows.items():
         (rows5 if v.startswith("5") else rows33)[lab] = r
+
+    # ---- 심플 모드 (이름 런/직접 지정 파일): 데이터 표 + 조건별 시트만 ----
+    # 기본 캠페인(무인자)만 제출 확정 풀 구조(수동 시트·비교 요약) 유지.
+    if run or csv or out:
+        from openpyxl import Workbook
+        tag = run or Path(out or cpath).stem
+        wb = Workbook()
+        built = False
+        if rows33:
+            _build_auto_sheet(
+                wb, rows33, sheet_name="3V3_자동",
+                title="STOP Procedure — VDD 3.3V 자동 측정",
+                sck_val="0/3.3V*", vdd_val="3.3 V", foot=FOOT_33, first=True)
+            built = True
+        if rows5:
+            _build_auto_sheet(
+                wb, rows5, sheet_name="5V_자동",
+                title="STOP Procedure — VDD 5.0V 자동 측정",
+                sck_val="0/5V*", vdd_val="5.0 V", foot=FOOT_5,
+                first=not built)
+            built = True
+        if not built:
+            wb.active.title = "데이터 없음"
+        _build_simple_summary(wb, all_rows, rows33, rows5, tag)
+        try:
+            wb.save(opath)
+        except PermissionError:
+            sys.exit(f"저장 실패 — {opath.name}이 엑셀에 열려 있음. 닫고 재실행.")
+        print(f"보고표 갱신(심플): {opath}")
+        print(f"  행 {len(all_rows)}개 (3.3V {len(rows33)} / 5V {len(rows5)})")
+        return
 
     from openpyxl import Workbook
 
     # 기존 보고표의 수동 시트 입력값 보존 (재생성 시 사용자가 손으로
     # 넣은 판독값이 날아가지 않게)
-    manual_saved = _load_manual_values()
+    manual_saved = _load_manual_values(opath)
+
+    # 수동 시트 시료 행 = CSV 라벨 ∪ 기존 수동 입력 라벨 (없으면 기본 틀)
+    seen = sorted({lab for (lab, _v) in all_rows})
+    old_labels = [l for l in seen if l.startswith("기존")]
+    new_labels = [l for l in seen
+                  if not l.startswith("기존") and not is_baseline(l)]
+    for (_sheet, _sec, lab) in manual_saved:
+        if is_baseline(lab):
+            continue
+        tgt = old_labels if lab.startswith("기존") else new_labels
+        if lab not in tgt:
+            tgt.append(lab)
+    if not old_labels and not new_labels:
+        old_labels = list(MANUAL_ROWS[:3])
+        new_labels = list(MANUAL_ROWS[3:6])
+    old_labels.sort()
+    new_labels.sort()
 
     wb = Workbook()
     group_avgs, baseline, OLD_LABELS, NEW_LABELS = _build_auto_sheet(
@@ -535,40 +722,140 @@ def generate():
             sck_val="0/5V*", vdd_val="5.0 V", foot=FOOT_5)
 
     for name, cfg in MANUAL_SHEETS.items():
-        _build_manual_sheet(wb, name, cfg, manual_saved)
+        _build_manual_sheet(wb, name, cfg, manual_saved,
+                            old_labels, new_labels)
 
-    # 요약 시트 (맨 앞): 3.3V 자동 그룹평균(차감) + 5V 수동 신규 STOP 인용
-    NEW3 = ["신규#1", "신규#2", "신규#3"]
-    OLD3 = ["기존#1", "기존#2", "기존#3"]
+    # 요약 시트 (맨 앞): 3.3V 자동 그룹평균(차감) + 5V 수동 STOP 인용
     base5 = _manual_mean(manual_saved, "5V_수동", "stop", ["빈소켓_baseline"])
-    new5 = _manual_mean(manual_saved, "5V_수동", "stop", NEW3)
-    old5 = _manual_mean(manual_saved, "5V_수동", "stop", OLD3)
+    new5 = _manual_mean(manual_saved, "5V_수동", "stop", new_labels)
+    old5 = _manual_mean(manual_saved, "5V_수동", "stop", old_labels)
+
+    # 5V 자동측정(캡+풀업/레벨시프터) 폴백 — 수동 시트 입력이 없으면 CSV의
+    # 5V 행에서 그룹 평균 산출 (요약 시트 인용용)
+    def _auto_mean(rows, labels):
+        vals = [float(rows[lb]["avg_uA"]) for lb in labels if lb in rows]
+        return sum(vals) / len(vals) if vals else None
+
+    base5a = next((float(r["avg_uA"]) for k, r in rows5.items()
+                   if is_baseline(k)), None)
+    if new5 is None:
+        n5a = _auto_mean(rows5, new_labels)
+        new5 = (n5a - (base5a or 0)) if n5a is not None else None
+    else:
+        new5 -= (base5 or 0)
+    if old5 is None:
+        o5a = _auto_mean(rows5, old_labels)
+        old5 = (o5a - (base5a or 0)) if o5a is not None else None
+    else:
+        old5 -= (base5 or 0)
     sumdata = {
         "old_33": (group_avgs["기존"] - baseline)
         if ("기존" in group_avgs and baseline is not None) else None,
         "new_33": (group_avgs["신규"] - baseline)
         if ("신규" in group_avgs and baseline is not None) else None,
-        "new_5": (new5 - (base5 or 0)) if new5 is not None else None,
-        "old_5": (old5 - (base5 or 0)) if old5 is not None else None,
-        "new_5n": _manual_mean(manual_saved, "5V_수동", "normal", NEW3),
-        "old_5n": _manual_mean(manual_saved, "5V_수동", "normal", OLD3),
-        "new_33n": _manual_mean(manual_saved, "3V3_수동", "normal", NEW3),
-        "old_33n": _manual_mean(manual_saved, "3V3_수동", "normal", OLD3),
+        "new_5": new5,
+        "old_5": old5,
+        "new_5n": _manual_mean(manual_saved, "5V_수동", "normal", new_labels),
+        "old_5n": _manual_mean(manual_saved, "5V_수동", "normal", old_labels),
+        "new_33n": _manual_mean(manual_saved, "3V3_수동", "normal", new_labels),
+        "old_33n": _manual_mean(manual_saved, "3V3_수동", "normal", old_labels),
     }
-    _build_summary_sheet(wb, sumdata)
+    if run:
+        _build_summary_generic(wb, sumdata, run)
+    else:
+        _build_summary_sheet(wb, sumdata)   # 기본 캠페인 = 제출 확정본 유지
 
     try:
-        wb.save(OUT_PATH)
+        wb.save(opath)
     except PermissionError:
-        sys.exit(f"저장 실패 — {OUT_PATH.name}이 엑셀에 열려 있음. 닫고 재실행.")
-    print(f"보고표 갱신: {OUT_PATH}")
+        sys.exit(f"저장 실패 — {opath.name}이 엑셀에 열려 있음. 닫고 재실행.")
+    print(f"보고표 갱신: {opath}")
     print(f"  3.3V: 기존 {len(OLD_LABELS)}개 + 신규 {len(NEW_LABELS)}개, 베이스라인 "
           f"{'있음' if baseline is not None else '없음(빈소켓_baseline 필요)'}"
           + (f" / 5V 자동: {len(rows5)}행" if rows5 else ""))
 
 
+def _build_summary_generic(wb, data: dict, run: str):
+    """이름 지정 런(새 테스트 그룹)용 요약 — 판정은 기준값으로 자동 산출.
+    (기본 캠페인의 요약은 제출 확정 문구가 있어 _build_summary_sheet 유지)"""
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    ws = wb.create_sheet("요약", 0)
+    thin = Side(style="thin")
+    box = Border(left=thin, right=thin, top=thin, bottom=thin)
+    head_fill = PatternFill("solid", fgColor="1F3864")
+    head_font = Font(color="FFFFFF", bold=True)
+    ok_fill = PatternFill("solid", fgColor="E2EFDA")
+    bad_fill = PatternFill("solid", fgColor="FCE4E4")
+    CRIT_UA = 10.0
+
+    ws.merge_cells("B2:G2")
+    t = ws.cell(row=2, column=2, value=f"STOP 전류 시험 요약 — {run}")
+    t.font = Font(bold=True, size=14, color="1F3864")
+    ws.cell(row=4, column=2, value=(
+        "판정 기준: 칩 테스트 플랜 'STOP' — Shutdown 모드 누설 VDD < 10 µA "
+        "(VDD 5.0V, SCK High 유지)")).font = Font(bold=True, size=10)
+
+    hdr = ["그룹", "5V STOP (µA, 차감)", "판정", "3.3V STOP (µA, 차감)",
+           "5V Normal (mA)", "3.3V Normal (mA)"]
+    r0 = 6
+    for i, h in enumerate(hdr):
+        c = ws.cell(row=r0, column=2 + i, value=h)
+        c.fill = head_fill
+        c.font = head_font
+        c.border = box
+        c.alignment = Alignment(horizontal="center")
+
+    def fmt(v):
+        return f"{v:.3f}" if isinstance(v, float) else "측정 대기"
+
+    def verdict(v):
+        if not isinstance(v, float):
+            return ("측정 대기", None)
+        return ("PASS", ok_fill) if v < CRIT_UA else \
+            (f"FAIL (기준 {v / CRIT_UA:.0f}배)", bad_fill)
+
+    rows = [("신규 그룹", data.get("new_5"), data.get("new_33"),
+             data.get("new_5n"), data.get("new_33n")),
+            ("기존 그룹", data.get("old_5"), data.get("old_33"),
+             data.get("old_5n"), data.get("old_33n"))]
+    for j, (gname, v5, v33, n5, n33) in enumerate(rows):
+        rr = r0 + 1 + j
+        vtxt, vfill = verdict(v5)
+        vals = [gname, fmt(v5), (vtxt, vfill), fmt(v33), fmt(n5), fmt(n33)]
+        for i, val in enumerate(vals):
+            cell = ws.cell(row=rr, column=2 + i)
+            if isinstance(val, tuple):
+                cell.value = val[0]
+                if val[1]:
+                    cell.fill = val[1]
+                cell.font = Font(bold=True)
+            else:
+                cell.value = val
+            cell.border = box
+            cell.alignment = Alignment(horizontal="center")
+
+    notes = [
+        "단위: STOP 표 = µA (DMM이 mA 표시면 ×1000 환산 기입) / Normal 표 = mA.",
+        "그룹 규칙: 라벨 '기존*' = 기존 그룹, 빈소켓/baseline = 베이스라인, 그 외 = 신규 그룹.",
+        "근거 데이터: '3V3_자동'(GUI 자동측정) · '3V3_수동' · '5V_수동' 시트 참조.",
+    ]
+    for i, s in enumerate(notes):
+        ws.cell(row=r0 + 4 + i, column=2, value=s).font = Font(size=9,
+                                                               italic=True)
+    widths = {2: 14, 3: 20, 4: 18, 5: 20, 6: 16, 7: 16}
+    for col, w in widths.items():
+        ws.column_dimensions[get_column_letter(col)].width = w
+
+
 def main():
-    generate()
+    arg = sys.argv[1].strip() if len(sys.argv) > 1 else None
+    if arg and arg.lower().endswith(".xlsx"):
+        out = Path(arg)                       # 파일 직접 지정 모드
+        generate(csv=str(out.with_suffix(".csv")), out=str(out))
+    else:
+        generate(arg or None)
 
 
 if __name__ == "__main__":

@@ -644,8 +644,16 @@ def ensure_iface_sheet(excel_path: Path):
         return name
 
     base = _spi_sheet(wb)               # 레이아웃 원본 = SPI 시트
+    _clone_layout_sheet(wb, base, name)
+    wb.save(excel_path)
+    print(f"I2C 전용 시트 생성: {name} (기본 시트 레이아웃 복제, 데이터 비움)")
+    return name
+
+
+def _clone_layout_sheet(wb, base, title):
+    """base 시트를 레이아웃만 복제 (샘플/메타 데이터 비움, 수식 보존)."""
     ws = wb.copy_worksheet(base)
-    ws.title = name
+    ws.title = title
 
     def is_formula(cell):
         return cell.data_type == "f" or (isinstance(cell.value, str)
@@ -667,9 +675,25 @@ def ensure_iface_sheet(excel_path: Path):
         hcell = ws.cell(row=HEADER_ROW, column=c)
         if isinstance(hcell.value, str):
             hcell.value = re.sub(r"\s*@.*$", "", hcell.value)
+    _strip_header_dates(ws)     # 복제 시트도 날짜 비움 (기록 시 실날짜 기입)
+    return ws
 
+
+def ensure_named_sheet(excel_path: Path, name: str) -> str:
+    """이름 지정 결과 시트 보장 — **새 테스트 그룹용** (2026-08-18).
+
+    있으면 그대로 재사용, 없으면 기본(SPI) 시트 레이아웃을 복제해 데이터를
+    비운 새 시트 생성. SHEET_NAME과 함께 쓰면 ADC 결과가 그 시트로 기록됨."""
+    from openpyxl import load_workbook
+    wb = load_workbook(excel_path)
+    if name in wb.sheetnames:
+        wb.close()
+        return name
+    base = _spi_sheet(wb)
+    _clone_layout_sheet(wb, base, name)
     wb.save(excel_path)
-    print(f"I2C 전용 시트 생성: {name} (기본 시트 레이아웃 복제, 데이터 비움)")
+    wb.close()
+    print(f"새 그룹 시트 생성: {name} (레이아웃 복제, 데이터 비움)")
     return name
 
 
@@ -686,11 +710,68 @@ def _find_dut_blocks(ws) -> list[tuple[int, int]]:
     return out
 
 
-def ensure_validation_workbook(excel_path: Path, template: Path):
+def _workbook_is_blank(excel_path: Path) -> bool:
+    """사용자가 직접 만든 '빈 통합문서'인지 판정 — 모든 시트에 값이 하나도
+    없으면 빈 것으로 본다 (엑셀 새 문서의 기본 Sheet1 등)."""
+    from openpyxl import load_workbook
+    try:
+        wb = load_workbook(excel_path)
+    except Exception:                     # noqa: BLE001 - 못 여는 파일은 보호
+        return False
+    try:
+        for ws in wb.worksheets:
+            for row in ws.iter_rows():
+                for cell in row:
+                    if cell.value is not None:
+                        return False
+        return True
+    finally:
+        wb.close()
+
+
+def _workbook_has_layout(excel_path: Path) -> bool:
+    """어느 시트든 DUT 블록 헤더가 있으면 레이아웃 보유로 판정."""
+    from openpyxl import load_workbook
+    wb = load_workbook(excel_path)
+    try:
+        return any(_find_dut_blocks(ws) for ws in wb.worksheets)
+    finally:
+        wb.close()
+
+
+def _strip_header_dates(ws):
+    """블록 헤더의 박제 날짜 제거 — '2026-07-14 DUT#1' → 'DUT#1'.
+    실제 날짜는 결과가 기록될 때 write_block_meta가 그날 날짜로 채움."""
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(row=HEADER_ROW, column=c).value
+        if isinstance(v, str) and re.match(r"\s*\d{4}-\d{2}-\d{2}", v):
+            ws.cell(row=HEADER_ROW, column=c).value = \
+                re.sub(r"^\s*\d{4}-\d{2}-\d{2}\s*", "", v, count=1)
+
+
+def ensure_validation_workbook(excel_path: Path, template: Path,
+                               sheet_name: str | None = None):
     """검증용 사본이 없으면 생성: 템플릿 복사 후 샘플 데이터 영역만 비움.
-    수식/통계/헤더는 그대로 유지 → 새 데이터 입력 시 자동 재계산."""
+    수식/통계/헤더는 그대로 유지 → 새 데이터 입력 시 자동 재계산.
+
+    2026-08-18 정비:
+    - 사용자가 미리 만든 **빈 엑셀**(값 없는 새 통합문서)도 템플릿으로 시딩.
+      값이 있는데 DUT 블록이 없는 파일은 데이터 보호를 위해 안내 후 중단.
+    - 신규 생성/시딩 시 **블록 헤더의 박제 날짜 제거** (기록 시 실제 날짜로
+      채워짐) + 상단 '날짜, HW Team' 줄 제거.
+    - sheet_name 지정 시 템플릿 기본 시트를 그 이름으로 **개명** — 새 파일이
+      곧바로 사용자가 정한 시트 하나로 시작 (별도 복제 시트 안 생김)."""
     if excel_path.exists():
-        return
+        if _workbook_has_layout(excel_path):
+            return
+        if _workbook_is_blank(excel_path):
+            print(f"빈 통합문서 감지: {excel_path.name} — 템플릿 레이아웃으로 시딩")
+            excel_path.unlink()           # 아래 신규 생성 경로로 진행
+        else:
+            raise CliError(
+                f"{excel_path.name}에 DUT 블록 레이아웃이 없습니다. "
+                "빈 파일이면 내용을 비우고 재실행(자동 시딩), 데이터가 있는 "
+                "파일이면 template\\report_template.xlsx의 시트를 복사해 넣으세요")
     if not template.exists():
         sys.exit(f"템플릿 없음: {template}")
     from openpyxl import load_workbook
@@ -702,9 +783,19 @@ def ensure_validation_workbook(excel_path: Path, template: Path):
         for col in (c, c + 1):                    # Internal Short, Channel A
             for r in range(DATA_START_ROW, DATA_START_ROW + N_SAMPLES):
                 ws.cell(row=r, column=col).value = None
+    # 레거시 박제값 정리: 블록 헤더 날짜 + 상단 '2026-07-14, HW Team' 줄
+    _strip_header_dates(ws)
+    for r in range(1, HEADER_ROW):
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(row=r, column=c).value
+            if isinstance(v, str) and re.match(r"\s*\d{4}-\d{2}-\d{2}", v):
+                ws.cell(row=r, column=c).value = None
+    if sheet_name:
+        ws.title = sheet_name             # 새 파일 = 지정 시트 하나로 시작
     wb.save(excel_path)
     print(f"검증용 워크북 생성: {excel_path.name} "
-          f"(원본 {template.name} 구조 유지, {len(blocks)}개 DUT 블록 데이터만 비움)")
+          f"(원본 {template.name} 구조, {len(blocks)}개 DUT 블록 비움"
+          + (f", 시트명 '{sheet_name}'" if sheet_name else "") + ")")
     print("  * openpyxl 저장 시 차트/일부 서식이 소실될 수 있음. 원본은 그대로니 확인만.")
 
 
